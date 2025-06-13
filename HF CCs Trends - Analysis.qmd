@@ -1,0 +1,5802 @@
+---
+title: "HF Trends, 1988 to 2023"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 12-15-2024
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com)"
+    affiliations: "Houston Methodist DeBakey Heart & Vascular Center"
+embed-resources: true
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Libraries
+
+```{r}
+#Load libs
+packs <- c("data.table", "dplyr", "foreach",
+           "stringr", "haven", "PooledCohort",
+           "ggplot2", "fastsurvey", "scales",
+           "flextable", "ggsci", "ggthemes",
+           "scales", "mgcv", "Hmisc", "msm", "svrep", "parallel"
+           )
+lapply(packs, require, character.only = TRUE)
+options(survey.lonely.psu = "adjust")
+source("multinomial_weighted_mod.R")
+```
+
+## Self-made functions
+
+### Analytic
+
+```{r}
+#Quantiles
+qs <- function(variable) quantile(variable, seq(0, 1, 0.05), na.rm = T)
+
+
+
+#Function to rename columns. Please note that this is a more general function not intended solely for this analysis and therefore contains other variables irrelevant to it.
+nhanes_rename <- function(x) { x %>% rename(any_of(c(
+  #Survey cycle and demographics
+  "survey_cycle" = "SDDSRVYR",
+  "age" = "RIDAGEYR",
+  "sex" = "RIAGENDR",
+  "race" = "RIDRETH1",
+  #Medical conditions
+  "htn_hist" = "BPQ020",
+  "dyslipid_hist" = "BPQ080",
+  "dm" = "DIQ010",
+  "pre_dm" = "DIQ160",
+  "chd" = "MCQ160C",
+  "angina" = "MCQ160D",
+  "mi" = "MCQ160E",
+  "stroke" = "MCQ160F",
+  "smoke_100" = "SMQ020",
+  "smoke_Now" = "SMQ040",
+  "cancer" = "MCQ220",
+  "dialysis" = "KIQ025",
+  "failing_kidney" = "KIQ022",
+  "hf" = "MCQ160B",
+  "hf_age" = "MCD180B",
+  "hf_age" = "MCQ180B",
+  "mi_age" = "MCD180E",
+  "mi_age" = "MCQ180E",
+  #Medical recommendations
+  "salt_adv_take" = "MCQ371C",
+  "chol_meds_adv" = "BPQ090D",
+  "chol_meds_take" = "BPQ100D",
+  "htn_meds_adv" = "BPQ040A",
+  "htn_meds_take" = "BPQ050A",
+  "aspirin_adv" = "RXQ510",
+  "aspirin_adv_take" = "RXQ515",
+  "aspirin_indep" = "RXQ520",
+  #Exam data
+  "sbp_1" = "BPXOSY1",
+  "sbp_2" = "BPXOSY2",
+  "sbp_3" = "BPXOSY3",
+  "sbp_1" = "BPXSY1",
+  "sbp_2" = "BPXSY2",
+  "sbp_3" = "BPXSY3",
+  "dbp_1" = "BPXODI1",
+  "dbp_2" = "BPXODI2",
+  "dbp_3" = "BPXODI3",
+  "dbp_1" = "BPXDI1",
+  "dbp_2" = "BPXDI2",
+  "dbp_3" = "BPXDI3",
+  "bmi" = "BMXBMI",
+  #Lab values
+  "fasting_glucose" = "LBXGLU",
+  "hba1c" = "LBXGH",
+  "apo_b" = "LBXAPB",
+  "ldl" = "LBDLDL",
+  "ldl_mh" = "LBDLDLM",
+  "ldl_nih" = "LBDLDLN",
+  "tg" = "LBXTR",
+  "hdl" = "LBDHDD",
+  "tc" = "LBXTC",
+  "creatinine" = "LBXSCR",
+  "creatinine" = "LBDSCR",
+  "urine_creatinine" = "URXUCR",
+  "urine_albumin" = "URXUMS",
+  "urine_albumin" = "URXUMASI",
+  "platelets" = "LBXPLTSI"
+)))
+}
+
+
+#Import an nhanes file given an NHANES folder and file
+import_nhanes <- function(nhanes_pair) {
+          
+          #State directory of files
+          files <- dir(paste0(nhanes_dir, nhanes_pair[1]))
+          
+          
+          #Import files in a given subfolder (lapply is Not needed here, but it is made to be more general in case you need more than 1 file a year)
+          lapply(files,
+                 function(file) {
+                    
+                    #Read the file
+                    data <- read_xpt(file = paste0(nhanes_dir, 
+                                                   nhanes_pair[1], "/", 
+                                                   file)
+                                     )
+                    #Rename columns
+                    data <- nhanes_rename(data)
+                    
+                    #If meds, start command to join medications together
+                    if(nhanes_pair[2] == "meds") {
+                      
+                      #Join medications together
+                      if("RXDDRUG" %in% colnames(data)) {
+                        data <- data %>%
+                          group_by(SEQN) %>%
+                          summarise(drug_names = paste(RXDDRUG, collapse = "; ")
+                                    )
+                        
+                      } else if("RXD240B" %in% colnames(data)) {
+                        
+                        data <- data %>%
+                          group_by(SEQN) %>%
+                          summarise(drug_names = paste(RXD240B, collapse = "; "),
+                                    )
+                      }
+                    }
+                    
+                    #Return the object
+                    data
+                   
+                 }
+                    
+          ) %>%
+            #Use rbindlist in case you are importing several years at once
+            rbindlist(fill = T) -> data
+          
+          
+}
+
+#Convert variables coded as 1279 in NHANES to Yes/No
+convert_1279 <- function(variable, Yes_ind = "Yes", No_ind = "No") {
+  fcase(variable == 1, Yes_ind,
+        variable == 2, No_ind) %>%
+    factor
+}
+
+#Convert variables coded as 123479 in NHANES to Yes/No (this is for aspirin use)
+convert_123479 <- function(variable, Yes_ind = "Yes", No_ind = "No") {
+  fcase(variable %in% c(1, 3), Yes_ind,
+        variable %in% c(2, 4), No_ind) %>%
+    factor
+}
+
+
+#Convert 77777/99999
+convert_5_79 <- function(variable) {
+  fifelse(variable %in% c(77777, 99999), NA, variable)
+}
+
+convert_3_89 <- function(variable) {
+  fifelse(variable %in% c(888, 999), NA, variable)
+}
+
+convert_4_89 <- function(variable) {
+  fifelse(variable %in% c(8888, 9999), NA, variable)
+}
+
+
+#Convert race
+convert_race_complete <-  function(variable) {
+  fcase(variable %in% c(1, 2), "Hispanic",
+        variable == 3, "Non-Hispanic White",
+        variable == 4, "Non-Hispanic Black",
+        variable == 6, "Non-Hispanic Asian",
+        variable == 7, "Other (including multiracial)"
+        )
+}
+
+#Convert race (excluding NH Asian; for backward compatability prior to ~2012)
+convert_race_incomplete <-  function(variable) {
+  fcase(variable %in% c(1, 2), "Hispanic",
+        variable == 3, "Non-Hispanic White",
+        variable == 4, "Non-Hispanic Black",
+        variable == 5, "Other"
+        )
+}
+
+#Convert NHANES III
+convert_race_nhanes_iii <-  function(variable) {
+  fcase(variable == 1, "Non-Hispanic White",
+        variable == 2, "Non-Hispanic Black"
+        )
+}
+
+#Function to indicate if drug was taken
+find_drug <- function(drugs_column, drug_string, Yes_ind = "Yes", No_ind = "No") {
+  fifelse(str_detect(drugs_column, drug_string), Yes_ind, No_ind)
+}
+
+#Function to indicate if indication is present
+find_ind <- function(inds_column, ind_string, Yes_ind = "Yes", No_ind = "No") {
+  fifelse(str_detect(inds_column, ind_string), Yes_ind, No_ind)
+}
+
+
+#Create a function to get survey means and CIs
+svymean_df <- function(design, variables) {
+  
+  #Get chosen variables in the form of "or"
+  variables[2] %>%
+    #Convert to character
+    paste0 %>%
+    #Replace + with or
+    str_replace_all("\\+", "\\|") %>%
+    #Squish together
+    str_replace_all(" \\| ", "\\|") -> chosen_vars
+  
+  #Get the part of svymean's name that corresponds to the variable name
+  svymean(design = design, variables, na.rm = T) %>%
+    names %>%
+    str_extract(chosen_vars) -> chosen_vars
+  
+  
+  #Produce data.table containing the information on totals
+  data.table(
+    #Variable
+    var = chosen_vars,
+    #Variable level
+    #Total
+    pe = svymean(design = design, variables, na.rm = T) %>%
+      data.frame %>%
+      {.$mean},
+    #LCI
+    lci = svymean(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X2.5..},
+    #UCI
+    uci = svymean(design = design, variables, na.rm = T) %>% confint %>% data.frame %>% {.$X97.5..}
+  ) -> mean_df
+  
+  #Return
+  mean_df
+  
+}
+
+
+svytotal_df_by <- function(var, by_var, 
+                           x = full_data,
+                           survey_object = sdata) {
+  x[, get(by_var) %>% unique] %>% na.omit -> by_var_levels
+  
+  #Formula for the by variable
+  var_formula <- paste0("~ ", var) %>% as.formula
+  
+  #Lapply (loop over levels using svytotal_df)
+  lapply(by_var_levels,
+         function(by_var_level)
+           svytotal_df(design = subset(survey_object,
+                                       subset = get(by_var) == by_var_level),
+                       var_formula) %>%
+           mutate(by_var = by_var_level)
+         ) %>%
+    rbindlist
+  
+  }
+
+
+#Create a function to neatly get survey totals/proportions and confidence intervals
+svytotal_df <- function(design, variables) {
+  
+  #Get chosen variables in the form of "or"
+  variables[2] %>%
+    #Convert to character
+    paste0 %>%
+    #Replace + with or
+    str_replace_all("\\+", "\\|") %>%
+    #Squish together
+    str_replace_all(" \\| ", "\\|") %>%
+    str_remove_all("I\\(|\\(|\\)") -> chosen_vars
+  
+  svytotal(design = design, variables, na.rm = T) -> svytotal_object
+  #Get the part of svytotal's name that corresponds to the variable name
+  svytotal_object %>%
+    names %>%
+    str_extract(chosen_vars) -> chosen_vars
+  
+  #Get the part of svytotal's name that corresponds to the variable value
+  svytotal_object %>%
+    names %>%
+    str_remove_all(chosen_vars) %>%
+    str_remove_all("I\\(|\\(|\\)") -> chosen_vars_levels
+  
+  #Produce data.table containing the information on totals
+  data.table(
+    #Variable
+    var = chosen_vars,
+    #Variable level
+    value = chosen_vars_levels,
+    #Total
+    pe = svytotal_object %>%
+      data.frame %>%
+      {.$total},
+    #LCI
+    lci = svytotal_object %>% confint %>% data.frame %>% {.$X2.5..},
+    #UCI
+    uci = svytotal_object %>% confint %>% data.frame %>% {.$X97.5..}
+  ) -> total_df
+  
+  lapply(chosen_vars_levels,
+         function(level) {
+           form <- bquote(~ .(variables[[2]]) == .(level))
+           #Get proportion
+           svyciprop(design = design, 
+          formula = form, na.rm = T
+          ) %>% {data.table(
+               prop_pe = .[1],
+               prop_lci = attr(., "ci") %>% .["2.5%"],
+               prop_uci = attr(., "ci") %>% .["97.5%"]
+             )}
+         }
+  ) %>%
+    rbindlist -> props_df
+  
+  #Bind
+  df <- cbind(total_df, props_df)
+  
+  #Return
+  df
+  
+}
+
+
+```
+
+####Props/RRs/Softmax
+
+```{r}
+
+
+#Softmax function
+softmax <- function(logits) {
+  exp(c(0, logits))/sum(exp(c(0, logits)))
+}
+
+
+#Function to get multinomial proprotions alongside corresponding confidence intervals
+#As input, the function requires a p by k coefficient matrix (k = p = N of coefficients N of outcomes), the variance covariance matrix,
+#and a design matrix
+#An optional newdata argument can be used if something other than that defined in the main function is needed
+get_props_ci <- function(coef_matrix, vcov_matrix, design_matrix, predictors_df = newdata) {
+  
+  
+  #N of outcomes
+  k <- ncol(coef_matrix)
+  #Multiply by the design matrix to get a matrix of logit predictions
+  logit_preds <- design_matrix %*% coef_matrix
+  
+  #Get CIs for each k outcome per year and place them in a list
+  lapply(1:nrow(logit_preds), 
+         function(i) {
+           
+           #Get point estimates
+           prop_pe <- softmax(logit_preds[i,])
+           
+           #Obtain the gradient of the logit
+           grad_logit <- kronecker(diag(k), t(design_matrix[i, ]))
+           
+           #Variance of the logit
+           var_logit <- grad_logit %*% vcov_matrix %*% t(grad_logit)
+          
+           #Symbols to loop over (reference category and all others)
+           loop_symbols <- c(0, paste0("x", 1:k))
+           denom <- loop_symbols %>% paste0("exp(", ., ")", collapse = "+")
+           nums <- loop_symbols %>% paste0("exp(", ., ")")
+           
+           #Loop over possible k outcomes
+           lapply(1:(k + 1),
+                  function(j) {
+           
+                    ##Use delta method to obtain the SE of the proportion on the log scale
+                    deltamethod(g = parse(text = paste0("log( ((", nums[j], ")/(", denom, ")) /", 
+                                                        "(1 - ((", nums[j], ")/(", denom, ")))", 
+                                                        ")" )),
+                                mean = logit_preds[i,],
+                                cov = var_logit
+                    ) -> delta_prop_se
+           
+           #Get the CIs on the log scale
+           plogis(qlogis(prop_pe[j]) + (c(-1.96, 0, 1.96)*delta_prop_se))
+           
+                  }
+           )  -> cis
+           
+           #Loop over sum of k outcomes (cumulative proportions)
+           num <- loop_symbols[-1] %>% paste0("exp(", ., ")") %>% paste0(collapse = "+")
+           
+           ##Use delta method to obtain the SE of the proportion on the log scale
+           deltamethod(g = parse(text = paste0(text = paste0("log( ((", nums, ")/(", denom, ")) /", 
+                                                             "(1 - ((", nums, ")/(", denom, ")))", 
+                                                             ")" ))),
+                       mean = logit_preds[i,],
+                       cov = var_logit
+           ) -> delta_prop_se
+           
+           #Get the CIs on the log scale
+           plogis(qlogis(sum(prop_pe[-1])) + (c(-1.96, 0, 1.96)*delta_prop_se)) -> cis_cum
+           
+           #Place CIs into the k+2 element of the list
+           cis[[k+2]] <- cis_cum
+           
+           #Return CIs
+           cis
+         }
+  ) -> pe_ci_list
+  
+
+  #Convert list to a data.table with PEs and CIs
+  lapply(1:(k + 2), function(k)
+    lapply(1:length(pe_ci_list), function(i) {
+      
+      #Create a data.table
+      pe_ci_list[[i]][[k]] %>%
+             {data.table(
+               lci = 100*.[1],
+               pe = 100*.[2],
+               uci = 100*.[3]
+             )} -> df_year
+      
+      #Bind with predictor values
+      cbind(df_year, data.table(predictors_df)[i,]) -> df_year
+      
+      #Add pe_ci
+      df_year[, pe_ci := paste0(r1(pe), " (", r1(lci), " to ", r1(uci), ")")]
+      
+    }
+      #Bind together yearly predictions for each k data.tables
+    ) %>% rbindlist) -> pe_ci_list
+  
+  #Name the subcomponents of the list
+  names(pe_ci_list) <- c("baseline", paste0("category_",(1:k)), "cumulative")
+  
+  #Return
+  pe_ci_list
+  
+}
+
+#Function to get risk ratios with confidence intervals from a multinomial model
+#As input, the function requires a p by k coefficient matrix (k = p = N of coefficients N of outcomes), the variance covariance matrix,
+#and a design matrix (2 by p)
+get_rr_ci <- function(coef_matrix, vcov_matrix, design_matrix) {
+  
+  #N of outcomes
+  k <- ncol(coef_matrix)
+  #Get logits in first and last year being compared
+  logit_preds <- design_matrix %*% coef_matrix
+  #Get point estimates of risk ratio
+  rrs <- softmax(logit_preds[2, ])/softmax(logit_preds[1,])
+  rrs[4] <- sum(softmax(logit_preds[2, ])[2:(k+1)])/sum(softmax(logit_preds[1, ])[2:(k+1)])
+  
+  #Obtain the gradient of the logit
+  grad_logit <- lapply(1:k, function(i) kronecker(diag(k), t(design_matrix[i,]))) %>% do.call(rbind, .)
+  
+  #Variance of the logit
+  var_logit <- grad_logit %*% vcov_matrix %*% t(grad_logit)
+  
+  #Symbols to loop over (reference category and all others)
+  loop_symbols1 <- c(0, paste0("x", 1:k))
+  loop_symbols2 <- c(0, paste0("x", (k + 1):(2 * k)))
+  
+  #Numerator/denominator for probability in 1988
+  denom1 <- loop_symbols1 %>% paste0("exp(", ., ")", collapse = "+")
+  nums1 <- loop_symbols1 %>% paste0("exp(", ., ")")
+  
+  #Numerator/denominator for probability in 2023
+  denom2 <- loop_symbols2 %>% paste0("exp(", ., ")", collapse = "+")
+  nums2 <- loop_symbols2 %>% paste0("exp(", ., ")")
+  
+  
+  #Build a vector of means for the delta method:
+  #x1 and x2 are 1998; x3 and x4 are 2023
+  mean_vector <- c(logit_preds[1,], logit_preds[2,])
+
+  #Loop over categories (& sums of categories) to obtain RRs and their CIs
+  lapply(1:(k + 1),
+         function(j) {
+           
+           #P1 and P2
+           p1 <- paste0("((", nums1[j], ")/(", denom1, "))" )
+           p2 <- paste0("((", nums2[j], ")/(", denom2, "))" )
+           rr_exp <- parse(text = paste0("log(", p2, "/", p1, ")" ))
+           
+           #Delta method
+           deltamethod(g = ~ log(
+             ( (exp(x4)) /(1 + exp(x3) + exp(x4)))
+             /
+               ( (exp(x2))/(1 + exp(x1) + exp(x2)))  
+           ),
+           mean = mean_vector,
+           cov = var_logit
+           ) -> delta_rr_se
+           
+           #Get PE and CI
+           exp(log(rrs[j]) + c(-1.96, 0, 1.96)*delta_rr_se)
+           
+         }
+         ) -> pe_cis
+  
+  
+        #Loop over sum of k outcomes (cumulative proportions)
+  #Cumulative proportions in 1988 and 2023
+  num1 <- loop_symbols1[-1] %>% paste0("exp(", ., ")") %>% paste0(collapse = "+")
+  num2 <- loop_symbols2[-1] %>% paste0("exp(", ., ")") %>% paste0(collapse = "+")
+  
+  #P1 and P2
+  p1 <- paste0("((", num1, ")/(", denom1, "))" )
+  p2 <- paste0("((", num2, ")/(", denom2, "))" )
+  rr_exp <- parse(text = paste0("log(", p1, "/", p2, ")" ))
+  
+        ##Use delta method to obtain the SE of the proportion on the log scale
+        deltamethod(g = rr_exp,
+                    mean = mean_vector,
+                    cov = var_logit
+        ) -> delta_rr_se
+        
+        #Get the CIs on the log scale
+        exp(log(rrs[k + 2]) + (c(-1.96, 0, 1.96)*delta_rr_se)) -> pe_cis_cum
+        
+        #Place CIs into the k+2 element of the list
+        pe_cis[[k+2]] <- pe_cis_cum
+        
+        #Convert each part of the list into a data.table
+        lapply(pe_cis, function(x) matrix(x, ncol = 3) %>% 
+                 data.table %>%
+                 setnames(new = .q(lci, pe, uci)) %>%
+                 mutate(pe_ci = paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")"))
+               ) -> pe_cis_list
+        
+        #Name list
+        names(pe_cis_list) <- c("baseline", paste0("category_",(1:k)), "cumulative")
+        
+        #Output
+        pe_cis_list
+
+  }
+
+
+```
+
+### Aesthetic
+
+```{r}
+
+#Create PE (CI) column
+pe_ci <- function(pe = pe, lci = lci, uci = uci, rounding = 2) {
+  paste0(
+    pe  %>% round(rounding) %>% format(nsmall = rounding), " (", 
+    lci %>% round(rounding) %>% format(nsmall = rounding), " to ",
+    uci  %>% round(rounding) %>% format(nsmall = rounding),
+    ")"
+  )
+}
+
+
+#Loop over numeric variables, sex, and binary (Yes/No) variables and summarize
+sum_var <- function(dataset, variable) {
+  #Numeric vars 
+  if(variable %in% numeric_variables) {
+    dataset[, 
+      paste0(median(get(variable), na.rm = T) %>% round(1) %>% format(nsmall = 1),
+             " (", 
+             iqr(get(variable)), ")"
+      )
+    ]
+  } 
+  
+  #Sex
+  else if(variable %>% str_detect("sex|gender")) {
+    paste0(dataset[get(variable) %in% c("female", "Female", "Women", "women"), .N] %>% scales::comma(),
+           " (", (100*dataset[get(variable) %in% c("female", "Female", "Women", "women"), .N]/dataset[, .N]) %>% r1, "%)")
+  }
+  
+  #Binary vars
+  else if(variable %in% binary_variables) {
+    paste0(dataset[get(variable) %in% c("Yes", "Yes"), .N] %>% scales::comma(),
+           " (", (100*dataset[get(variable) %in% c("Yes", "Yes"), .N]/dataset[, .N]) %>% r1, "%)")
+  }
+}
+
+
+#Get IQRs
+iqr <- function(x, rounding = 1) {
+  paste0(
+    quantile(x, 0.25, na.rm = T) %>% round(rounding) %>% format(nsmall = rounding),
+    " to ",
+    quantile(x, 0.75, na.rm = T) %>% round(rounding) %>% format(nsmall = rounding)
+  )
+  
+}
+
+#Round to 1 decimal and include zero if needed
+r1 <- function(x) {
+  x %>% round(1) %>% format(nsmall = 1)
+}
+
+#Round to 2 decimals and include zero if needed
+r2 <- function(x) {
+  x %>% round(2) %>% format(nsmall = 2)
+}
+
+#Perform some aesthetic modifications for flextables
+flextable_aes <- function(table, table_title) {
+  
+  #Table font
+  table <- flextable::font(table, fontname = "Times New Roman", part = "all")
+  
+  #Align everything centrally
+  table <- flextable::align(table, align = "center", part = "all")
+  
+  #Table heading
+  table <- flextable::set_caption(table, caption = table_title)
+  
+  #Align footer to the left
+  table <- flextable::align(table, align = "left", part = "footer")
+  
+  
+  #Set Table width
+  table <- flextable::width(table, width = 1.5, unit = "in")
+  
+  #Bold
+  table <- flextable::bold(table, part = "header")
+  
+  #Borders
+  table <- table %>% border_inner %>% border_outer
+  
+  #Print
+  table
+}
+
+```
+
+ # NHANES (1999-2023)
+
+## Import
+
+```{r}
+
+#The lefthand side is the name of the folder in which the respective NHANES data files should be deposited. The lefthand side is the name that will be used for the data.frame in R
+folders_dfs <- list(
+  c("Demographics", "demo"),
+  c("LDL_TG_Measure", "ldl_tg_measure"),
+  c("TC_measure", "tc_measure"),
+  c("HDL_Measure", "hdl_measure"),
+  c("Glycohemoglobin", "hba1c"),
+  c("Fasting_Glucose", "fasting_glucose"),
+  c("BMI", "bmi"),
+  c("BP_Measure", "bp_measure"),
+  c("BP_Chol", "bp_chol"),
+  c("Diabetes", "dm_df"),
+  c("Smoke", "smoke_df"),
+  c("Urine albumin and creatinine", "urine_alb_cr"),
+  c("Medical Conditions", "med_conds"),
+  c("Biochem Profile", "biochem"),
+  c("Aspirin", "aspirin"),
+  c("Meds", "meds"),
+  c("CBC", "cbc"),
+  c("Kidney", "kidney")
+)
+
+#Get NHANES directory
+nhanes_dir <- "C:/Ahmed's Stuff/ResearchStuff/NHANES_Data/"
+
+#Lapply to import NHANES data for a given set of variables
+lapply(folders_dfs, function(folder) import_nhanes(folder)) -> data
+
+#Use Reduce to successively merge elements of the data list
+Reduce(function(x, y) merge(x, y, all = T, by = "SEQN"), data) -> data
+
+##TABLE 1 FUNCTION
+table1_create <- function(dataset, variables, table1_title, 
+                          strata_var = NULL, 
+                          p_values = FALSE,
+                          p_values_col_ind = 5,
+                          table_width = 3,
+                          numeric_variables, binary_variables
+) {
+  
+  #Store variable names
+  var_names <- names(variables)
+  
+  
+  #Get overall CCs using the sum_var function
+  lapply(var_names, function(variable) sum_var(dataset, variable)) -> overall_values
+  
+  #Create strata CCs using the same but with an additional layer of looping for strata levels
+  if(!is.null(strata_var)) {
+    
+    #Strata levels  
+    strata_levels <- dataset[, get(strata_var) %>% factor %>% levels]
+    
+    #Apply over levels of strata of interest
+    lapply(1:length(strata_levels),
+           function(i)
+           {
+             stratum <- strata_levels[[i]]
+             #CCs of level 1
+             lapply(var_names, function(variable) sum_var(dataset = dataset[get(strata_var) == stratum], variable)) %>%
+               unlist
+           }
+    ) -> strata_values
+    
+    
+  }
+  
+  
+  #Create data.table containing the relevant variables
+  data.table(
+    variable_names = variables %>% unlist,
+    variable_values = overall_values %>% unlist
+  ) -> table1_df
+  
+  #Create new columns with the corresponding values for each strata
+  if(!is.null(strata_var)) {
+    for(i in 1:length(strata_values)) {
+      table1_df[, paste0("level_", i) := strata_values[[i]]]
+      setnames(table1_df, old = paste0("level_", i), new = strata_levels[i])
+    }
+  }
+  
+  #Get p-values if necessary
+  if(p_values) {
+    #Loop over variables to get test statistics
+    lapply(var_names, 
+           function(var_name) test_var(dataset, variable = var_name, strata_var)) %>% unlist -> pvals
+    table1_df[, p_values := pvals]
+  }
+  
+  #Rename and create a flextable
+  table1_df %>%
+    rename(any_of(c(
+      "Variables" = "variable_names",
+      "Overall" = "variable_values",
+      "P-values*" = "p_values"
+    ))) %>%
+    flextable %>% 
+    flextable_aes(table1_title) %>%
+    bold(j = 1) %>%
+    width(width = table_width) -> table_flex
+  
+  #Add P-value if relevant
+  if(p_values) {
+    table_flex <- footNote(table_flex, 
+             ref_symbols = footNote_symbol(1), 
+             j = p_values_col_ind,
+             value = as_paragraph("P-values were obtained from Wilcoxon test for continuous variables or from a Chi-square test for categorical variables."))
+  }
+  
+  #Produce table
+  table_flex
+}
+```
+
+## Clean & Prep
+
+### Non-Survey Columns
+
+```{r}
+
+#Convert variables coded as 1, 2, 7, or 9
+columns_1279 <- c("pre_dm", "dm", "htn_hist", "smoke_100", "dyslipid_hist",
+                  "chd", "mi", "stroke", "angina", 
+                  "cancer", "htn_meds_adv", "htn_meds_take",
+                  "aspirin_adv", "aspirin_indep", 
+                  "failing_kidney", "dialysis", "hf")
+data[, (columns_1279) := lapply(.SD, convert_1279, "Yes", "No"), 
+     .SDcols = columns_1279]
+
+#If patient has not been adviced to take anti HTN meds by physician, make "take HTN meds on advice of physician" (htn_meds_take) a No
+data[, htn_meds_take := fifelse(htn_meds_adv == "No", "No", "Yes")]
+
+#Convert sex
+data[, sex := fcase(
+    sex == 1, "Men",
+    sex == 2, "Women"
+) %>% factor]
+
+#Build a string for statins
+statin_string <- c("(?i)LOVASTATIN|PRAVASTATIN|FLUVASTATIN|ROSUVASTATIN|PITAVASTATIN|ATORVASTATIN|SIMVASTATIN|CERIVASTATIN")
+ccb_string <- c("(?i)AMLODIPINE|VERAPAMIL|DILTIAZEM")
+acei_string <- c("(?i)LISINOPRIL|ENALAPRIL|CAPTOPRIL|BENAZEPRIL|FOSINOPRIL")
+arb_string <- c("(?i)LOSARTAN|VALSARTAN|OLMESARTAN|CANDESARTAN|IRBESARTAN|TELMISARTAN|AZILSARTAN")
+thiazide_string <- c("(?i)HYDROCHLOROTHIAZIDE|CHLORTHALIDONE|INDAPAMIDE")
+bb_string <- c("(?i)ATENOLOL|METOPROLOL|BISOPROLOL")
+htn_string <- paste0(ccb_string, "|", acei_string, "|", arb_string, "|", thiazide_string, "|", bb_string)
+
+#Indicate drug use
+data[, statin := find_drug(drug_names, statin_string, "Yes", "No")]
+data[, ccb := find_drug(drug_names, ccb_string, "Yes", "No")]
+data[, acei := find_drug(drug_names, acei_string, "Yes", "No")]
+data[, arb := find_drug(drug_names, arb_string, "Yes", "No")]
+data[, thiazide := find_drug(drug_names, thiazide_string, "Yes", "No")]
+data[, bb := find_drug(drug_names, bb_string, "Yes", "No")]
+data[, htn_drug := find_drug(drug_names, htn_string, "Yes", "No")]
+data[, htn_drug %>% factor %>% summary]
+data[, htn_meds := fifelse(htn_meds_take == "Yes" | htn_drug == "Yes", "Yes", 
+                                "No") %>% factor]
+
+
+#Convert race
+data[, race := convert_race_incomplete(race)]
+data[, black := fifelse(race == "Non-Hispanic Black", "Yes", "No")]
+data[, hispanic := fifelse(race == "Hispanic", "Yes", "No")]
+data[, asian := fifelse(race == "Asian", "Yes", "No")]
+
+
+#Convert current smoking habits
+data[, smoke_Now := fcase(
+  smoke_Now == 1, "Yes",
+  smoke_Now == 2, "Yes",
+  smoke_Now == 3, "No",
+  smoke_100 == "No", "No"
+)]
+
+#Create obesity
+data[, obesity := fifelse(bmi >= 30, "Yes", "No") %>%
+       factor]
+data[, severe_obesity := fifelse(bmi >= 40, "Yes", "No") %>%
+       factor]
+
+#Calcualte avg systolic and diastolic BP
+data[, sbp := (sbp_1 + sbp_2 + sbp_3)/3]
+data[, dbp := (dbp_1 + dbp_2 + dbp_3)/3]
+
+#Define DM
+# data[, dm := fcase(
+#   hba1c >= 6.5, "Yes",
+#   dm == "Yes", "Yes",
+#   dm == "No", "No"
+#   )]
+
+#DM
+data[, dm := fifelse(
+  hba1c >= 6.5, "Yes", "No"
+  )]
+#PreDM
+data[, pre_dm := fifelse(
+  hba1c >= 5.7 & hba1c < 6.5, "Yes", "No"
+  )]
+#PreDM or DM
+data[, pre_dm_or_dm := fifelse(
+  hba1c >= 5.7, "Yes", "No"
+  )]
+
+
+#Calculate sex-specific constants for eGFR estimation
+data[, alpha := fifelse(sex == "Men", -0.302, -0.241)]
+data[, k := fifelse(sex == "Men", 0.9, 0.7)]
+data[, constant := fifelse(sex == "Men", 1, 1.012)]
+
+#Realibrate creatinine in 1999-2000 (See: https://pubmed.ncbi.nlm.nih.gov/18037092/)
+data[survey_cycle == 1, creatinine := 0.147 + (creatinine*1.013)]
+
+#Realibrate creatinine in 2005-2006 (See:https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2005/DataFiles/BIOPRO_D.htm)
+data[survey_cycle == 4, creatinine := -0.016 + (creatinine*0.978)]
+
+#Calculate eGFR
+data[, egfr :=
+    142 *
+    (pmin(creatinine/k, 1)^alpha) *
+    (pmax(creatinine/k, 1)^-1.2) *
+    (0.9938^age) *
+    constant
+    ]
+
+
+#Correct urine albumin units from 1999 to 2003
+
+#Create albumin/creatinine ratio
+data[urine_albumin == 888888, urine_albumin := NA]
+data[urine_creatinine == 88888, urine_creatinine := NA]
+#Convert to mg/g (1000 for g to mg for urine creatinine and 10 for dL to L for urine creatinine as wel. 1000/10 = 100)
+data[, uacr := 100*urine_albumin/urine_creatinine]
+
+```
+
+### Survey-related Columns
+
+```{r}
+#Adjust examination survey weights to reflect proportion of data from each cycle
+#Exam
+data[survey_cycle != "2017 to 2020", exam_weight := WTMEC2YR] 
+data[survey_cycle == 66, exam_weight := WTMECPRP] 
+data[is.na(exam_weight), exam_weight := 0]
+
+#Interview
+data[survey_cycle != "2017 to 2020", int_weight := WTINT2YR] 
+data[survey_cycle == 66, int_weight := WTINTPRP] 
+data[is.na(int_weight), int_weight := 0]
+
+#Fasting
+data[survey_cycle != "2017 to 2020", fast_weight := WTSAF2YR.y] 
+data[survey_cycle == 66, fast_weight := WTSAFPRP.x] 
+data[is.na(fast_weight), fast_weight := 0]
+
+
+#Do the same for questionnaire survey weights
+
+#Make last survey follow the previous ones in terms of numeric coding.
+data[, survey_cycle := fifelse(survey_cycle == 66, 10, survey_cycle) %>% factor]
+
+#Modify survey_cycle variable
+levels(data$survey_cycle) <- c("1999 to 2000", "2001 to 2002", "2003 to 2004", "2005 to 2006", "2007 to 2008", "2009 to 2010", "2011 to 2012", "2013 to 2014", "2015 to 2016", "2017 to 2020", "2021 to 2023")
+
+```
+
+# NHANES III (1988-1994)
+
+## Import
+
+```{r}
+
+#NHANES III has a different file structure to other NHANES files. Therefore, it will be processed using separate blocks of code
+#Please note that this NHANES III dataset has been preprocessed. It was originally composed of 4 separate files which were merged together using the SEQN column. The code needed to merge these 4 separate files is provided as a separate document on this page.
+library(qs)
+qread(paste0(nhanes_dir, "NHANES III/", "NHANES III List.RData")) -> nhanes_iii_data
+names(nhanes_iii_data) <- c("adult", "youth", "exam", "lab")
+
+##Remove all column names from other files that overlap with column names in the exam data.frame (except SEQN, which will be used to join them)
+colnames(nhanes_iii_data$exam) -> exam_colnames
+exam_colnames <- exam_colnames[exam_colnames != "SEQN"]
+nhanes_iii_data$adult[, (exam_colnames) := NULL]
+nhanes_iii_data$youth[, (exam_colnames) := NULL]
+nhanes_iii_data$lab[, (exam_colnames) := NULL]
+
+#Use Reduce to successively merge elements of the data list
+
+# merge(nhanes_iii_data$exam,
+#       merge(nhanes_iii_data$lab,
+#      rbind(nhanes_iii_data$adult, nhanes_iii_data$youth, fill = T),
+#      by = "SEQN",
+#      all = T),
+#      by = "SEQN",
+#      all = T
+#      ) -> nhanes_iii_data
+
+Reduce(function(x, y) merge(x, y, all = T, by = "SEQN"), 
+    nhanes_iii_data) -> nhanes_iii_data
+```
+
+## Clean & Prep
+
+###Prescription data
+
+```{r}
+
+haven::read_xpt(paste0(nhanes_dir, "NHANES III/", "pupremed.xpt")) -> nhanes_iii_prescription_data
+
+
+nhanes_iii_prescription_data <- data.table(nhanes_iii_prescription_data)
+nhanes_iii_prescription_data <- nhanes_iii_prescription_data[, .(HQRXCODE = paste0(HQRXCODE, collapse = ";")), by = "SEQN"]
+
+
+#Build a string for statins
+statin_nhanes_iii_string <- c("1664|3064|3088")
+
+#CCBs, ACEIs, Thiazides
+ccb_nhanes_iii_string <- c("3072|2425|1069")
+acei_nhanes_iii_string <- c("1647|1458|1138|1139|0642|0643|3053|3052")
+#arb_nhanes_iii_string None exists
+thiazide_nhanes_iii_string <- c("0180|0643|1139|1451|1452|1456|1457|1458|1459|1460|1461|1462|1463|1464|1465")
+bb_nhanes_iii_string <- c("0333|0334|1460|1801")
+htn_nhanes_iii_string <- paste0(ccb_nhanes_iii_string, "|", acei_nhanes_iii_string, "|", thiazide_nhanes_iii_string, "|", bb_nhanes_iii_string)
+
+nhanes_iii_prescription_data[, statin := find_drug(HQRXCODE, statin_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[statin == "Yes", .N]
+nhanes_iii_prescription_data[, ccb := find_drug(HQRXCODE, ccb_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[, acei := find_drug(HQRXCODE, acei_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[, arb := "No"]
+nhanes_iii_prescription_data[, thiazide := find_drug(HQRXCODE, thiazide_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[, bb := find_drug(HQRXCODE, bb_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[, htn_drug := find_drug(HQRXCODE, htn_nhanes_iii_string, "Yes", "No")]
+nhanes_iii_prescription_data[htn_drug == "Yes", .N]
+
+#Merge
+nhanes_iii_data <- merge(nhanes_iii_data, nhanes_iii_prescription_data, 
+                         by = "SEQN", all.x = T, all.y = F)
+
+
+```
+
+### Non-Survey Columns
+
+```{r}
+nhanes_iii_rename <- function(x) { x %>% rename(any_of(c(
+  #Survey cycle and demographics
+  "survey_cycle" = "SDDSRVYR",
+  "age" = "HSAGEIR",
+  "age_unit" = "RIDAGEYR",
+  "sex" = "HSSEX",
+  "sex" = "HSSEX",
+  "race" = "DMARACER",
+  "ethn" = "DMAETHNR",
+  "int_weight1" = "WTPFQX1",
+  "int_weight2" = "WTPFQX2",
+  "mec_exam_weight1" = "WTPFEX1",
+  "mec_exam_weight2" = "WTPFEX2",
+  "mh_exam_weight1" = "WTPFHX1",
+  "mh_exam_weight2" = "WTPFHX2",
+  "morning_weight1" = "WTPFHSD1",
+  "morning_weight2" = "WTPFHSD2",
+  "int_weight1" = "WTPFEX1",
+  "int_weight2" = "WTPFEX2",
+  "fast_hrs" = "PHPFAST",
+  #Medical conditions
+  "htn_hist" = "HAE2",
+  "dyslipid_hist" = "HAE7",
+  "dm" = "HAD1",
+  "pre_dm" = "ABSENT",
+  "chd" = "ABSENT",
+  "angina" = "ABSENT",
+  "mi" = "HAF10",
+  "mi_age" = "HAF12R",
+  "stroke" = "HAC1D",
+  "smoke_100" = "SMQ020",
+  "smoke_Now" = "SMQ040",
+  "cancer" = "HAC10",
+  "dialysis" = "ABSENT",
+  "failing_kidney" = "ABSENT",
+  "hf" = "HAC1C",
+  "hf_age" = "HAC3CR",
+  #Medical recommendations
+  "salt_adv_take" = "HAE5C",
+  "chol_meds_adv" = "BPQ090D",
+  "chol_meds_take" = "BPQ100D",
+  "htn_meds_adv" = "HAE4A",
+  "htn_meds_take" = "HAE5A",
+  "aspirin_adv" = "ABSENT",
+  "aspirin_adv_take" = "ABSENT",
+  "aspirin_indep" = "ABSENT",
+  #Exam data
+  "sbp_1" = "HAZA8AK1",
+  "sbp_2" = "HAZA8BK1",
+  "sbp_3" = "HAZA8CK1",
+  "sbp_4" = "HAZA8DK1",
+  "dbp_1" = "HAZA8AK5",
+  "dbp_2" = "HAZA8BK5",
+  "dbp_3" = "HAZA8CK5",
+  "dbp_4" = "HAZA8DK5",
+  "height" = "BMPHT",
+  "body_weight" = "BMPWT",
+  #Lab values
+  "fasting_glucose" = "ABSENT",
+  "hba1c" = "GHP",
+  "apo_b" = "ABP",
+  "ldl" = "LCP",
+  "tg" = "TGP",
+  "hdl" = "HDP",
+  "tc" = "TCP",
+  "creatinine" = "CEP",
+  "urine_creatinine" = "URP",
+  "urine_albumin" = "UBP",
+  "platelets" = "PLP"
+)))
+}
+
+#Remove .x
+colnames(nhanes_iii_data) <- colnames(nhanes_iii_data) %>%
+  str_remove(".x")
+
+#Keep unique columns only
+nhanes_iii_data[, .SD, .SDcols = unique(names(nhanes_iii_data))] -> nhanes_iii_data
+
+#Rename columns
+nhanes_iii_rename(nhanes_iii_data) -> nhanes_iii_data
+
+#Convert variables coded as 1, 2, 7, or 9
+nhanes_iii_columns_1279 <- columns_1279[columns_1279 %in% names(nhanes_iii_data)]
+nhanes_iii_data[, 
+                (nhanes_iii_columns_1279) := lapply(.SD, convert_1279, "Yes", "No"), 
+     .SDcols = nhanes_iii_columns_1279]
+
+#If patient has not been adviced to take anti HTN meds by physician, make "take HTN meds on advice of physician" (htn_meds_take) a No
+nhanes_iii_data[, htn_meds_take := fifelse(htn_meds_adv == "No", "No", "Yes")]
+nhanes_iii_data[, htn_meds := fifelse(htn_meds_take == "Yes" | htn_drug == "Yes", "Yes", 
+                                "No") %>% factor]
+
+
+#NA absent columns
+nhanes_iii_data[body_weight == 888888, body_weight := NA]
+nhanes_iii_data[height == 88888, height := NA]
+nhanes_iii_data[creatinine == 8888, creatinine := NA]
+nhanes_iii_data[fast_hrs == 88888, fast_hrs := NA]
+#NA tgs if non-fasting
+nhanes_iii_data[fast_hrs < 9 | is.na(fast_hrs), tg := NA]
+
+
+
+#Convert numerically coded NA SBP/DBP
+nhanes_iii_data[, names(.SD) := lapply(.SD, convert_3_89),
+                .SDcols = c(paste0("sbp_", 1:3))]
+nhanes_iii_data[, names(.SD) := lapply(.SD, convert_3_89),
+                .SDcols = c(paste0("dbp_", 1:3))]
+#Calcualte avg systolic and diastolic BP
+nhanes_iii_data[, sbp := (sbp_1 + sbp_2 + sbp_3)/3]
+nhanes_iii_data[, dbp := (dbp_1 + dbp_2 + dbp_3)/3]
+
+
+#Convert sex
+nhanes_iii_data[, sex := fcase(
+  sex == 1, "Men",
+  sex == 2, "Women"
+) %>% factor]
+
+#Race and ethnicity
+nhanes_iii_data[, race := convert_race_nhanes_iii(race)]
+nhanes_iii_data[ethn %in% c(1, 2), race := "Hispanic"]
+nhanes_iii_data[is.na(race), race := "Other"]
+
+#Calculate sex-specific constants for eGFR estimation
+nhanes_iii_data[, alpha := fifelse(sex == "Men", -0.302, -0.241)]
+nhanes_iii_data[, k := fifelse(sex == "Men", 0.9, 0.7)]
+nhanes_iii_data[, constant := fifelse(sex == "Men", 1, 1.012)]
+
+#Convert the numerical NAs in Hba1c
+nhanes_iii_data[, hba1c := convert_4_89(hba1c)]
+
+#Define DM
+# nhanes_iii_data[, dm := fcase(
+#   hba1c >= 6.5, "Yes",
+#   dm == "Yes", "Yes",
+#   dm == "No", "No"
+# ) %>% factor]
+
+#DM
+nhanes_iii_data[, dm := fifelse(
+  hba1c >= 6.5, "Yes", "No"
+) %>% factor]
+#PreDM
+nhanes_iii_data[, pre_dm := fifelse(
+  hba1c >= 5.7 & hba1c < 6.5, "Yes", "No"
+  ) %>% factor]
+#PreDM or DM
+nhanes_iii_data[, pre_dm_or_dm := fifelse(
+  hba1c >= 5.7, "Yes", "No"
+  ) %>% factor]
+
+
+#Calibrate creatinine (See: https://pubmed.ncbi.nlm.nih.gov/18037092/)
+nhanes_iii_data[, creatinine := -0.184 + (0.960*creatinine)]
+#Calculate eGFR
+nhanes_iii_data[, egfr :=
+       142 *
+       (pmin(creatinine/k, 1)^alpha) *
+       (pmax(creatinine/k, 1)^-1.2) *
+       (0.9938^age) *
+       constant
+]
+
+#Create albumin/creatinine ratio
+nhanes_iii_data[urine_albumin == 888888, urine_albumin := NA]
+nhanes_iii_data[urine_creatinine == 88888, urine_creatinine := NA]
+nhanes_iii_data[, uacr := 100*urine_albumin/urine_creatinine]
+
+#Create BMI
+nhanes_iii_data[, bmi :=
+                  (body_weight)/
+                  ((height/100)^2)
+                  ]
+
+#Create obesity
+nhanes_iii_data[, obesity := fifelse(bmi >= 30, "Yes", "No") %>%
+                  factor]
+nhanes_iii_data[, severe_obesity := fifelse(bmi >= 40, "Yes", "No") %>%
+                  factor]
+
+
+```
+
+### Survey-related Columns
+
+```{r}
+#Create survey cycle variable
+nhanes_iii_data[, survey_cycle := fcase(SDPPHASE == 1, "1988 to 1991",
+                                        SDPPHASE == 2, "1991 to 1994") %>% factor]
+
+#Weight
+nhanes_iii_data[, exam_weight := fcase(survey_cycle == "1988 to 1991",
+                                       mh_exam_weight1,
+                                       survey_cycle == "1991 to 1994",
+                                       mh_exam_weight2)]
+
+nhanes_iii_data[, int_weight := fcase(survey_cycle == "1988 to 1991",
+                                       int_weight1,
+                                       survey_cycle == "1991 to 1994",
+                                       int_weight2)]
+nhanes_iii_data[, fast_weight := fcase(survey_cycle == "1988 to 1991",
+                                       morning_weight1,
+                                       survey_cycle == "1991 to 1994",
+                                       morning_weight2)]
+nhanes_iii_data[is.na(fast_weight), fast_weight := 0]
+
+#PSU
+nhanes_iii_data[, SDMVPSU := fcase(survey_cycle == "1988 to 1991",
+                                       SDPPSU1,
+                                       survey_cycle == "1991 to 1994",
+                                       SDPPSU2)]
+
+#Strata
+nhanes_iii_data[, SDMVSTRA := fcase(survey_cycle == "1988 to 1991",
+                                       SDPSTRA1,
+                                       survey_cycle == "1991 to 1994",
+                                       SDPSTRA2)]
+
+
+nhanes_iii_data <- nhanes_iii_data[!is.na(exam_weight) | !is.na(int_weight)]
+```
+
+# Full NHANES
+
+## Merge
+
+```{r}
+#Get columns to keep
+colnames(nhanes_iii_data)[colnames(nhanes_iii_data) %in% colnames(data)] -> nhanes_iii_keep
+nhanes_iii_data <- nhanes_iii_data[, ..nhanes_iii_keep]
+
+#Merge
+rbind(nhanes_iii_data, data, fill = T) -> full_data
+
+
+```
+
+## Inclusion Criteria
+
+```{r}
+#Heart failure, N
+hf_n <- full_data[hf == "Yes", .N]
+```
+
+## Create/modify some columns
+
+```{r}
+full_data[,
+          year :=
+            fcase(
+              survey_cycle == "1988 to 1991", 1990.25,
+              survey_cycle == "1991 to 1994", 1993.25,
+              survey_cycle == "1999 to 2000", 2000,
+              survey_cycle == "2001 to 2002", 2002,
+              survey_cycle == "2003 to 2004", 2004,
+              survey_cycle == "2005 to 2006", 2006,
+              survey_cycle == "2007 to 2008", 2008,
+              survey_cycle == "2009 to 2010", 2010,
+              survey_cycle == "2011 to 2012", 2012,
+              survey_cycle == "2013 to 2014", 2014,
+              survey_cycle == "2015 to 2016", 2016,
+              survey_cycle == "2017 to 2020", 2018.6,
+              survey_cycle == "2021 to 2023", 2022.7
+            )
+            ]
+
+#Correctly label missing codes for TG/LDL
+full_data[, tg := convert_3_89(tg)]
+full_data[, ldl := convert_3_89(ldl)]
+full_data[, tc := convert_3_89(tc)]
+full_data[, tg := convert_4_89(tg)]
+full_data[, ldl := convert_4_89(ldl)]
+
+#Cap age at 80 to be consistent throughout
+full_data[, age := fifelse(age > 80, 80, age)]
+
+#Column for dyslipidemia
+full_data[, dyslipid := fifelse(tg >= 200 | ldl >= 160, "Yes", "No") %>% factor]
+full_data[, hyperldl := fifelse(ldl >= 160, "Yes", "No") %>% factor]
+full_data[, hypertg := fifelse(tg >= 200, "Yes", "No") %>% factor]
+full_data[, hypercholesterol := fifelse(tc >= 200, "Yes", "No") %>% factor]
+
+#Create ordinal sex/race variables (this only serves to estimate a difference-in-smooths GAM later on when we want to test for sex-specific time trends).
+full_data[, sex_ord := factor(sex, ordered = T)]
+full_data[, race_binary := factor(fifelse(race == "Non-Hispanic White", "Non-Hispanic White", "Non-Hispanic Black, Hispanic, or Other Minority"), ordered = F)]
+full_data[, race_binary_ord := factor(fifelse(race == "Non-Hispanic White", "Non-Hispanic White", "Non-Hispanic Black, Hispanic, or Other Minority"), ordered = T)]
+
+#HF as an ordinal variable (same reason as above; to facilitate GAM interaction)
+full_data[, hf_ord := factor(hf, ordered = T)]
+
+#Modify columns where DBP is not recorded (missing Korotokoff sound)
+full_data[dbp == 0, dbp := NA]
+
+#Create HTN categories
+full_data[, htn := fifelse(sbp >= 130 | dbp >= 80, "Yes", "No") %>% factor]
+full_data[, htn_stage2 := fifelse(sbp >= 140 | dbp >= 90, "Yes", "No") %>% factor]
+
+#Column for diabetes categorization (for multinomial regression)
+full_data[, dm_cats := fcase(
+  hba1c >= 6.5, 2,
+  hba1c %between% c(5.7, 6.49), 1,
+  hba1c < 5.7, 0
+)]
+
+full_data[, obesity_cats := fcase(
+  bmi >= 40, 2,
+  bmi %between% c(30, 39.999), 1,
+  bmi < 30, 0
+)]
+
+full_data[, htn_cats := fcase(
+  sbp >= 140 | dbp >= 90, 2,
+  sbp %between% c(130, 139.999) | dbp %between% c(80, 89.999) , 1,
+  sbp < 130 & dbp <80, 0
+)]
+
+
+#CKD
+full_data[, ckd45 := fifelse(egfr < 30, "Yes", "No") %>% factor]
+full_data[, ckd345 := fifelse(egfr < 60, "Yes", "No") %>% factor]
+full_data[, ckd345_albumin := fifelse(egfr < 60 | uacr >= 30, "Yes", "No") %>% factor]
+full_data[, microalbuminuria := fifelse(uacr %between% c(30, 300), "Yes", "No") %>% factor]
+full_data[, macroalbuminuria := fifelse(uacr > 300, "Yes", "No") %>% factor]
+full_data[, albuminuria := fifelse(uacr >= 30, "Yes", "No") %>% factor]
+
+
+#Relevel hypertension factors
+full_data[, htn := factor(htn, levels = c("No", "Yes"))]
+
+#Create history of hypertension variable based on present elevation or previous self-reported history
+full_data[, htn_hist2 := fifelse(htn_hist == "Yes" | sbp >= 130 | dbp >= 80, "Yes", "No") %>% factor]
+
+
+#Create history of dyslipidemia variable based on present elevation or previous self-reported history
+full_data[, dyslipid_hist2 := fifelse(dyslipid_hist == "Yes" | tc >= 200, "Yes", "No") %>% factor]
+full_data[, acei_arb := fifelse(acei == "Yes" | arb == "Yes", "Yes", "No")]
+full_data[, htn_meds_count := ((thiazide == "Yes") + (ccb == "Yes") + (bb == "Yes") + (acei_arb == "Yes") )]
+full_data[, htn_meds_count_cats := fifelse(htn_meds_count > 2, 2, htn_meds_count)]
+full_data[, 
+          c("ccb", "bb", "acei_arb", "thiazide", "statin") := lapply(.SD, factor), 
+          .SDcols = c("ccb", "bb", "acei_arb", "thiazide", "statin")]
+
+
+```
+
+## Convert to a survey object
+
+```{r}
+#Make survey object out of x
+
+#Exams
+sdata <- svydesign(data = full_data,
+                  ids = full_data$SDMVPSU,
+                strata = full_data$SDMVSTRA,
+                weights = full_data$exam_weight,
+                nest = TRUE)
+sdata <- subset(sdata, age >= 20)
+
+#Questionnaire
+sdata_q <- svydesign(data = full_data,
+                ids = full_data$SDMVPSU,
+                strata = full_data$SDMVSTRA,
+                weights = full_data$int_weight,
+                nest = TRUE)
+sdata_q <- subset(sdata_q, age >= 20)
+full_data <- full_data[age >= 20]
+
+#Fasting
+sdata_fast <- svydesign(data = full_data,
+                ids = full_data$SDMVPSU,
+                strata = full_data$SDMVSTRA,
+                weights = full_data$fast_weight,
+                nest = TRUE)
+sdata_fast <- subset(sdata_fast, age >= 20)
+
+full_data <- full_data[age >= 20]
+```
+
+# Analyze
+
+## Bootstrap replicates of survey
+
+```{r}
+#These two objects will be used throughout the analysis to carry out the bootstrap replicates-based analyses
+set.seed(100)
+sdata_rep <- as_bootstrap_design(sdata,
+                                 type = "Rao-Wu-Yue-Beaumont",
+                                 replicates = 500)
+
+sdata_rep_q <- as_bootstrap_design(sdata_q,
+                                 type = "Rao-Wu-Yue-Beaumont",
+                                 replicates = 500)
+
+
+sdata_rep_fast <- as_bootstrap_design(sdata_fast,
+                                 type = "Rao-Wu-Yue-Beaumont",
+                                 replicates = 500)
+
+```
+
+## GAM functions
+
+### \[Binomial outcomes\]
+
+#### Overall
+
+```{r}
+
+
+# survey_design = sdata_q
+# survey_replicates <- sdata_rep_q
+# data = full_data
+# newdata = newdata_overall
+# survey_weights = full_data[hf == "Yes", int_weight]
+# int_var <- "overall"
+# model_formula <- paste0("pre_dm_or_dm", c(overall_form, sex_form, race_form))[1]
+# model_formula <- dyslipid~s(year, k = gam_k)
+# 
+# rm(survey_design, data, newdata, survey_weights, int_var, model_formula)
+
+#Function to automate GAM estimation for risk factors underlying HF
+#int_var is only defined here for the sake of compatability with the subgroup-specific function because they will both be used in the same lapply loop
+gam_rep <- function(survey_design,
+                    survey_replicates,
+                    data,
+                    newdata,
+                    survey_weights,
+                    model_formula,
+                    int_var = NULL,
+                    return_gam_object = FALSE) {
+  
+  #Assign survey weights to the data.frame (so that gam finds it)
+  data[, survey_weights := survey_weights ]
+  #GAM object (to retrieve spline basis matrix)
+  gam(
+    data = data,
+    family = binomial,
+    method = "REML",
+    formula = model_formula,
+    weights = survey_weights) -> gam_object
+  
+  #Obtain design matrix
+  design_matrix <- predict(gam_object, newdata = newdata,
+                           type = "lpmatrix")
+  
+  
+  #Get bootstrap estiamte of the variance
+  withReplicates(design = survey_replicates,
+                 theta = function(w, d) {
+                   
+                   #Reassign formulas to the current environment
+                   f <- model_formula
+                   environment(f) <- environment()
+                   
+                   
+                   coef(gam(
+                   family = binomial,
+                   method = "REML",
+                   formula = f,
+                   weights = w,
+                   data = d)
+                 )
+                 }
+  ) -> reps
+  
+  
+  #Get standard errors and point estimates
+  cov_matrix <- design_matrix %*% vcov(reps) %*% t(design_matrix)
+  se <- sqrt(diag(cov_matrix))
+  pe <- design_matrix %*% coef(reps)
+  
+  #Store predictions
+  data.table(cbind(newdata,
+        data.table(
+    pe = 100*as.numeric(plogis(pe)),
+    lci = 100*as.numeric(plogis(pe - (1.96*se))),
+    uci = 100*as.numeric(plogis(pe + (1.96*se)))
+  ))) -> preds_df
+  
+  #Get PE/CI
+  preds_df[, pe_ci := paste0(r1(pe), " (", r1(lci), " to ", r1(uci), ")")]
+  
+  #Apply delta method to obtain SEs of risk ratios
+  msm::deltamethod(g = ~ log((exp(x2)/(1+exp(x2))) / (exp(x1)/(1+exp(x1)))),
+              mean = pe[c(1, length(pe))],
+              cov = cov_matrix[c(1, length(pe)),c(1, length(pe))]
+              ) -> rr_se
+
+  #Obtain log-RR
+  log((exp(pe[length(pe)])/(1 + exp(pe[length(pe)])))/(exp(pe[1])/(1 + exp(pe[1])))) -> rr_pe
+ 
+  
+  #Store RR contrasts
+  data.table(pe = exp(rr_pe),
+             lci = exp(rr_pe - (1.96*rr_se)),
+             uci = exp(rr_pe + (1.96*rr_se))
+             ) -> contrasts_df
+  #Get PE/CI
+  contrasts_df[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+  
+  
+  #Get year-wise estimates (no model smoothing)
+svytotal_df_by(var = as.character(model_formula[[2]]), 
+               by_var = "year",
+               x = data,
+               survey_object = survey_design) %>%
+  filter(value == "Yes") -> year_df
+  
+#Return gam_object if true
+if(!return_gam_object) {gam_object <- NULL}
+
+  #Get output
+  list(preds_df = preds_df,
+       year_df = year_df,
+       contrasts_df = contrasts_df,
+       vcov = vcov(reps),
+       coef = coef(reps),
+       gam_object = gam_object)
+  
+}
+
+```
+
+#### Interaction
+
+```{r}
+
+# i = 3
+# survey_design = sdata %>% subset(hf == "Yes")
+# data = full_data[hf == "Yes"]
+# newdata = newdata_race
+# survey_weights = full_data[hf == "Yes", int_weight]
+# int_var <- "race_binary"
+# model_formula <- rfs_base_list$model_formulae[3]
+# model_formula <- rfs_base_list$model_formulae[[i]] %>% formula
+# survey_replicates <- sdata_rep %>% subset(hf == "Yes")
+
+rm(survey_design, data, newdata, survey_weights, int_var, model_formula, survey_replicates)
+#Function to automate GAM estimation for risk factors underlying HF
+gam_rep_int <- function(survey_design,
+                    data,
+                    newdata,
+                    survey_weights,
+                    model_formula,
+                    survey_replicates,
+                    int_var) {
+  
+  
+  #Assign survey weights to the data.frame (so that gam finds it)
+  data[, survey_weights := survey_weights ]
+  #GAM object (to retrieve spline basis matrix)
+  gam(
+    data = data,
+    family = binomial,
+    method = "REML",
+    formula = model_formula,
+    weights = survey_weights) -> gam_object
+  
+  #Obtain design matrix
+  design_matrix <- predict(gam_object, newdata = newdata, type = "lpmatrix")
+  
+  #Get bootstrap estimate of the variance
+  withReplicates(design = survey_replicates,
+                 theta = function(w, d) {
+                   
+                   #Reassign formulas to the current environment
+                   environment(model_formula) <- environment()
+                   
+                   
+                   coef(gam(
+                   family = binomial,
+                   method = "REML",
+                   formula = model_formula,
+                   weights = w,
+                   data = d)
+                 )
+                 }
+  ) -> reps
+  
+  #Get standard errors and point estimates
+  cov_matrix <- design_matrix %*% vcov(reps) %*% t(design_matrix)
+  se <- sqrt(diag(cov_matrix))
+  pe <- design_matrix %*% coef(reps)
+  
+  #Store predictions
+  #Store predictions
+  data.table(cbind(newdata,
+        data.table(
+    pe = 100*as.numeric(plogis(pe)),
+    lci = 100*as.numeric(plogis(pe - (1.96*se))),
+    uci = 100*as.numeric(plogis(pe + (1.96*se)))
+  ))) -> preds_df
+  
+  #Get PE/CI
+  preds_df[, pe_ci := paste0(r1(pe), " (", r1(lci), " to ", r1(uci), ")")]
+  
+  
+  #Get number of unique factors to loop over
+  preds_df[, get(int_var) %>% unique] -> unique_factors
+  
+  #Apply delta method to obtain SEs of risk ratios. 
+  lapply(unique_factors,
+         function(level) {
+           
+           #Get the row indices which correspond to the first and last year for each factor
+  preds_df[, range(which(get(int_var) == level))] -> level_indices
+           
+           #Apply the delta method
+  msm::deltamethod(g = ~ log((exp(x2)/(1+exp(x2))) / (exp(x1)/(1+exp(x1)))),
+                   mean = pe[level_indices],
+                   cov = cov_matrix[level_indices, level_indices]
+  ) -> rr_se
+  
+  #Obtain log-RR
+  log(preds_df[max(level_indices), pe]/preds_df[min(level_indices), pe]) -> rr_pe
+  
+  #Store RR contrasts
+  data.table(pe = exp(rr_pe),
+             lci = exp(rr_pe - (1.96*rr_se)),
+             uci = exp(rr_pe + (1.96*rr_se))) -> contrast_df
+             
+             #Get PE/CI
+             contrast_df[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+             
+             #Return
+             contrast_df
+  }
+  ) -> contrasts_df
+  
+  #Convert to a data.table and store factor levels
+  contrasts_df <- rbindlist(contrasts_df)[, int_factor := unique_factors]
+  
+  #Compare increases
+  preds_df[, lapply(unique_factors, 
+                    function(level) range(which(get(int_var) == level))) %>%
+             unlist %>%
+             sort] -> all_levels_indices
+  
+  #Ratio of ratios
+  contrasts_df[, log(max(pe)) - log(min(pe))] -> rrr_pe
+  
+  #SE for ratio of ratios using the delta method
+  msm::deltamethod(g = ~ log((exp(x2)/(1+exp(x2))) / (exp(x1)/(1+exp(x1)))) -
+                     log((exp(x4)/(1+exp(x4))) / (exp(x3)/(1+exp(x3)))),
+                   mean = pe[all_levels_indices],
+                   cov = cov_matrix[
+                     all_levels_indices, 
+                     all_levels_indices]
+  ) -> rrr_se
+  
+  
+  #Identify interaction indices (containing :)
+  which(str_detect(names(gam_object$coefficients), ":")) -> selection_vector
+  #P-value for interaction
+  mgcv:::testStat(p = coef(reps)[selection_vector], V = vcov(reps)[selection_vector, selection_vector],
+                X = gam_object$R[, selection_vector],
+                rank = gam_object$edf1[selection_vector] %>% sum,
+                type = 0,
+                res.df = -1)$pval -> p_int
+  
+  #Create a DF combining them
+  rrr_df <- data.table(pe = exp(rrr_pe),
+                       lci = exp(rrr_pe - (1.96*rrr_se)),
+                       uci = exp(rrr_pe + (1.96*rrr_se)),
+                       #P-value for relative difference of 1988 vs 2023 in males vs females (a double contrast in time and sex, at 1988 and 2023 specifically)
+                       pval_contrast = 2*(1 - pnorm(abs(rrr_pe), mean = 0, sd = rrr_se)),
+                       #P-value for interaction (not for a particular contrast)
+                       pval_int = p_int
+                       )
+  
+  
+  #Get year-wise estimates (no model smoothing)
+  lapply(unique_factors,
+         function(level) {
+           
+           #Subset expression
+           subset_survey <- do.call("subset", 
+                                      list(x = survey_design, 
+                                           subset = parse(text = paste0(int_var, " == \"", level, "\""))
+                                           )
+                                    )
+     
+           #year_df
+  svytotal_df_by(var = as.character(model_formula[[2]]), 
+                 by_var = "year",
+                 x = data,
+                 survey_object = subset_survey) %>%
+  filter(value == "Yes") -> year_df
+  
+  #Assign name of factor
+  year_df[, int_factor := level]
+  
+  #Return
+  year_df
+         }
+  ) -> year_list
+  
+  #Convert to a data.table and store factor levels
+  year_df <- rbindlist(year_list)
+  
+
+  #Get output
+  list(preds_df = preds_df,
+       year_df = year_df,
+       contrasts_df = contrasts_df,
+       rrr_df = rrr_df)
+  
+}
+```
+
+### \[Multinomial outcomes\]
+
+#### Overall
+
+```{r}
+
+# survey_design = sdata %>% subset(hf == "Yes" & htn_hist2 == "Yes" & year <= 2020)
+# survey_replicates <- sdata_rep %>% subset(hf == "Yes" & htn_hist2 == "Yes" & year <= 2020)
+# data = full_data[hf == "Yes" & htn_hist2 == "Yes" & year <= 2020]
+# newdata = newdata_overall %>% filter(year <= 2020)
+# survey_weights = full_data[hf == "Yes" & htn_hist2 == "Yes" & year <= 2020, int_weight]
+# int_var <- "overall"
+# model_formula <- rfs_base_list$model_formulae[[1]] %>% lapply(formula)
+# constituent_outcomes <- rfs_base_list$constituent_outcomes
+# rm(survey_design, survey_replicates, data, newdata, survey_weights, int_var, model_formulae, constituent_outcomes)
+
+gam_rep_mn <- function(survey_design,
+                        data,
+                        newdata,
+                        survey_weights,
+                        model_formula,
+                        constituent_outcomes,
+                        survey_replicates,
+                        k = 2,
+                        int_var = NULL) {
+  
+  
+  #Assign survey weights to the data.frame (so that gam finds it)
+  data[, survey_weights := survey_weights ]
+  #GAM object (to retrieve spline basis matrix)
+  gam(
+    data = data,
+    family = multinom_wtd_mod(K = k),
+    method = "REML",
+    formula = model_formula,
+    weights = survey_weights) -> gam_object
+  
+  
+  #Get bootstrap estiamte of the variance
+  withReplicates(design = survey_replicates,
+                 theta = function(w, d) {
+                   
+                   #Reassign formulas to the current environment
+                   f <- model_formula %>% lapply(function(form_part) 
+                   {formula(form_part) -> form_part
+                     environment(form_part) <- environment()
+                     form_part
+                   })
+                   
+                   
+                   coef(gam(
+                   family = multinom_wtd_mod(K = k),
+                   method = "REML",
+                   formula = f,
+                   weights = w,
+                   data = d)
+                 )
+                 }
+  ) -> reps
+  
+  
+  #Get length of coefficients and divide by k (to get N of coefficients per outcome)
+  nc <- length(coef(reps))/k
+  
+  #Save coefficients in K - 1 lists
+  coefs_list <- lapply(seq(0, k - 1, 1), function(i) coef(reps)[((i*nc) + 1):((i + 1)*nc)])
+  
+  #Obtain design matrix
+  design_matrix <- predict(gam_object, newdata = newdata,
+                           type = "lpmatrix")[, 1:nc]
+  
+  
+  #Place the coefficients into an n by k matrix
+  coef_matrix <- coef(reps) %>% matrix(ncol  = k)
+  
+  #Make predictions of prevalence from 1988 to 2023
+  preds_dfs <- get_props_ci(coef_matrix = coef_matrix, vcov_matrix = vcov(reps), design_matrix = design_matrix,
+                            predictors_df = newdata)
+  
+  #Get RRs comparing the last to first year
+  contrasts_dfs <- get_rr_ci(coef_matrix = coef_matrix, vcov_matrix = vcov(reps), design_matrix = design_matrix[c(1, nrow(design_matrix)), ])
+
+  #cats levels (reference, 1 to k, and sum of k)
+  cats_levels <- c("== 0", paste0("== ", seq(1, k)), ">0")
+  lapply(
+    cats_levels, function(cat_level)
+      
+  #Get year-wise estimates (no model smoothing)
+  svytotal_df_by(var = paste0("I(", as.character(model_formula[[1]])[2], cat_level, ")"), 
+                 by_var = "year",
+                 survey_object = survey_design) %>%
+    filter(value == TRUE)
+  
+  ) -> year_dfs
+  
+  #Summarize output in a list
+  lapply(1:(k + 2),
+         function(i) 
+           list("preds_df" = preds_dfs[[i]], 
+                "year_df" = year_dfs[[i]], 
+                "contrasts_df" = contrasts_dfs[[i]])
+         ) -> output
+  
+  #Name output by constituent outcomes
+  names(output) <- c("baseline", constituent_outcomes)
+  
+  #Return
+  output
+  
+}
+
+```
+
+#### Interaction
+
+```{r}
+
+#Function to automate GAM estimation for risk factors underlying HF
+#This function is used for multinomial outcomes (e.g., HTN stages and DM/PreDM)
+#int_var is only defined here for the sake of compatibility with the subgroup-specific function because they will both be used in the same lapply loop
+gam_rep_mn_int <- function(survey_design,
+                           data,
+                           newdata,
+                           survey_weights,
+                           model_formula,
+                           constituent_outcomes,
+                           k = 2,
+                           survey_replicates,
+                           int_var = NULL,
+                           return_gam_object = FALSE) {
+  
+  
+  #Assign survey weights to the data.frame (so that gam finds it)
+  data[, survey_weights := survey_weights]
+  #GAM object (to retrieve spline basis matrix)
+  gam(
+    data = data,
+    family = multinom_wtd_mod(K = k),
+    method = "REML",
+    formula = model_formula,
+    weights = survey_weights) -> gam_object
+  
+  
+  #Get bootstrap estiamte of the variance
+  withReplicates(design = survey_replicates,
+                 theta = function(w, d) {
+                   
+                   #Reassign formulas to the current environment
+                   f <- model_formula %>% lapply(function(form_part) 
+                   {formula(form_part) -> form_part
+                     environment(form_part) <- environment()
+                     form_part
+                   })
+                   
+                   
+                   coef(gam(
+                     family = multinom_wtd_mod(K = k),
+                     method = "REML",
+                     formula = f,
+                     weights = w,
+                     data = d)
+                   )
+                 }
+  ) -> reps
+  
+  
+  #Get length of coefficients and divide by k (to get N of coefficients per outcome)
+  nc <- length(coef(reps))/k
+  
+  #Save coefficients in K - 1 lists
+  coefs_list <- lapply(seq(0, k - 1, 1), function(i) coef(reps)[((i*nc) + 1):((i + 1)*nc)])
+  
+  #Obtain design matrix
+  design_matrix <- predict(gam_object, newdata = newdata,
+                           type = "lpmatrix")[, 1:nc]
+  
+  #Place the coefficients into an n by k matrix
+  coef_matrix <- coef(reps) %>% matrix(ncol  = k)
+  
+  #Make predictions of prevalence from 1988 to 2023
+  preds_dfs <- get_props_ci(coef_matrix = coef_matrix, 
+                            vcov_matrix = vcov(reps), 
+                            design_matrix = design_matrix,
+                            predictors_df = newdata)
+  
+  #Get row numbers of which to get RRs based on
+  data.table(newdata) -> newdata
+  newdata[year == max(year) | year == min(year), which = T] %>% split(rep(1:(length(.)/2), each = 2)) -> i_list
+  
+  #Get RRs comparing the last to first year for each year
+  lapply(i_list,
+         function(i)
+           get_rr_ci(coef_matrix = coef_matrix, vcov_matrix = vcov(reps), design_matrix = design_matrix[c(i[[1]], i[[2]]), ]) %>%
+           rbindlist(idcol = "outcome") %>%
+           mutate(int_factor = newdata[i[[1]],] %>% select(-year) %>% pull %>% unique)
+         ) %>%
+    rbindlist -> contrasts_df
+  
+  #Place RRs into separate lists for each outcome
+  lapply(contrasts_df[, unique(outcome)],
+         function(outcome_cat) contrasts_df[outcome == outcome_cat]) -> contrasts_dfs
+  names(contrasts_dfs) <- names(preds_dfs)
+  
+  #Get number of unique factors to loop over
+  newdata[, get(int_var) %>% unique] -> unique_factors
+  
+  #Get year-wise estimates (no model smoothing)
+  #cats levels (reference, 1 to k, and sum of k)
+  cats_levels <- c("== 0", paste0("== ", seq(1, k)), ">0")
+  
+  #Loop over k outcomes
+  lapply(
+    cats_levels, function(cat_level)
+      
+      #Get year-wise estimates (no model smoothing) per interaction level
+      lapply(unique_factors,
+             function(level) {
+               
+               #Subset expression
+               subset_survey <- do.call("subset", 
+                                        list(x = survey_design, 
+                                             subset = parse(text = paste0(int_var, " == \"", level, "\""))
+                                        )
+               )
+               
+               #Get year-wise estimates (no model smoothing)
+               svytotal_df_by(var = paste0("I(", as.character(model_formula[[1]])[2], cat_level, ")"), 
+                              by_var = "year",
+                              survey_object = subset_survey) %>%
+                 filter(value == TRUE) %>%
+                 mutate(int_factor = level) -> year_level_dfs
+             }
+      ) %>%
+      rbindlist-> year_df
+    
+  ) -> year_dfs
+  
+  
+  #Identify interaction indices (containing :)
+  which(str_detect(names(gam_object$coefficients), ":")) -> selection_vector
+  #P-value for interaction
+  mgcv:::testStat(p = coef(reps)[selection_vector], V = vcov(reps)[selection_vector, selection_vector],
+                  X = gam_object$R[, selection_vector],
+                  rank = gam_object$edf1[selection_vector] %>% sum,
+                  type = 0,
+                  res.df = -1)$pval -> p_int
+  
+  
+  #Return gam_object if true
+if(!return_gam_object) {gam_object <- NULL}
+  
+  #Summarize output in a list
+  lapply(1:(k + 2),
+         function(i) 
+           list("preds_df" = preds_dfs[[i]], 
+                "year_df" = year_dfs[[i]], 
+                "contrasts_df" = contrasts_dfs[[i]],
+                "vcov" = vcov(reps),
+                "coef" = coef(reps),
+                "gam_object" = gam_object)
+  ) -> output
+  
+  #Name output by constituent outcomes
+  names(output) <- c("baseline", constituent_outcomes)
+  
+  output$p_interaction <- p_int
+  
+  #Return
+  output
+}
+
+
+```
+
+
+
+### Prediction dataframes
+
+```{r}
+#Overall
+newdata_overall <- data.frame(year = 1988:2023)
+
+#Sex
+newdata_sex <- data.frame(year = rep(1988:2023, times = 2),
+                     sex = rep(c("Women", "Men"), 
+                               each = length(1988:2023)))
+newdata_sex$sex_ord <- newdata_sex$sex
+
+#Race/ethnicity
+newdata_race <- data.frame(year = rep(1988:2023, times = 2),
+                     race_binary = rep(c("Non-Hispanic White", "Non-Hispanic Black, Hispanic, or Other Minority"), 
+                               each = length(1988:2023)))
+newdata_race$race_binary_ord <- newdata_race$race_binary
+```
+
+
+### Setup
+
+```{r}
+#This block will set up a list that will be used recurrently throughout the next modelling tasks
+
+
+overall_form <- .q(~ s(year, k = gam_k))
+sex_form <- .q(~ sex + s(year, k = gam_k) + s(year, by = sex_ord, k = gam_k))
+race_form <- .q(~ race_binary + s(year, k = gam_k) + s(year, by = race_binary_ord, k = gam_k))
+
+
+#Analyses types
+int_vars <- c("overall", "sex", "race_binary")
+#
+#Data list
+newdata_list <- list(newdata_overall, newdata_sex, newdata_race)
+#Functions list
+gam_rep_list <- list(gam_rep_mn, gam_rep_mn_int, gam_rep_int)
+#Create a base list (only missing different formulae)
+list(trends_function = gam_rep_list,
+     newdata = newdata_list,
+     int_vars = int_vars) -> rfs_base_list 
+
+```
+
+## HF Prevalence
+
+### Model
+
+```{r}
+#Set up formula
+list(
+  paste0("hf", c(overall_form)),
+  paste0("hf", c(sex_form)),
+  paste0("hf", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep_q",
+                          "sdata_q", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = sdata_q,
+              data = full_data,
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[, int_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = sdata_rep_q
+            )
+          }
+) -> hf_trends
+names(hf_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+### Figures
+
+#### Create figure directories
+
+```{r}
+
+dir.create(path = paste0("Figures/", int_vars[1]), recursive = T)
+dir.create(path = paste0("Figures/", int_vars[2]))
+dir.create(path = paste0("Figures/", int_vars[3]))
+
+```
+
+#### Overall (crude proportions)
+
+```{r}
+trends_hf_fig <- ggplot(data = hf_trends$overall$preds_df,
+      aes(x = year,
+          y = pe,
+          ymin = lci,
+          ymax = uci)) +
+  #Add point estimates based on cycle-specific estimates
+  geom_pointrange(inherit.aes = F,
+                  data =  hf_trends$overall$year_df %>%
+                    filter(value == "Yes"),
+                  aes(x = by_var,
+                      y = prop_pe*100,
+                      ymin = prop_lci*100,
+                      ymax = prop_uci*100),
+                  color = "grey10",
+                  alpha = 0.4,
+                  fatten = 4,
+                  lwd = 1) +
+  #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.5, lwd = 0, fill = "lightblue2") +
+  geom_line(lwd = 1.5, color = "maroon") +
+  geom_point(size = 3, color = "maroon") +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Crude prevalence (%)",
+    breaks = seq(0, 100, 0.5)
+  ) +
+  #Add title
+  ggtitle(paste0("Prevalence (proportional) of self-reported heart failure in the US, 1988-2023"),
+          subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents model-smoothed temporal trends and the blue shade represents its 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"))
+
+ggsave(trends_hf_fig,
+       filename = paste0("Figures/overall/HF Trends [Crude Proportions].pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+```
+
+
+#### Overall (crude N)
+
+##### Data
+
+```{r}
+full_data[age >= 20 & !is.na(hf), 
+          .(N = sum(int_weight)), 
+          by = survey_cycle][, .(survey_cycle, 
+                                 first_year = word(survey_cycle, 1, sep = " to ") %>% as.numeric,
+                                 last_year = word(survey_cycle, 2, sep = " to ") %>% as.numeric,
+                                 N
+                                 )][
+                                   , .(year = seq(first_year, last_year), N = rep(N, last_year - first_year + 1)),
+                                   by = survey_cycle
+                                 ] %>%
+  #One row will be repated twice (for 1991)
+  unique(by = "year") -> n_by_year
+merge(n_by_year,
+      hf_trends$overall$preds_df,
+      by = "year"
+      ) -> n_props_df
+n_props_df[, hf_n_pe := (pe/100)*N]
+n_props_df[, hf_n_lci := (lci/100)*N]
+n_props_df[, hf_n_uci := (uci/100)*N]
+
+```
+
+##### Plot
+
+```{r}
+trends_hf_n_fig <- ggplot(data = n_props_df,
+      aes(x = year,
+          y = hf_n_pe,
+          ymin = hf_n_lci,
+          ymax = hf_n_uci)) +
+  #Add point estimates based on cycle-specific estimates
+  geom_pointrange(inherit.aes = F,
+                  data =  hf_trends$overall$year_df %>%
+                    filter(value == "Yes"),
+                  aes(x = by_var,
+                      y = pe,
+                      ymin = lci,
+                      ymax = uci),
+                  color = "grey10",
+                  alpha = 0.4,
+                  fatten = 4,
+                  lwd = 1) +
+  #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.5, lwd = 0, fill = "lightblue2") +
+  geom_line(lwd = 1.5, color = "maroon") +
+  geom_point(size = 3, color = "maroon") +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Crude prevalence (in millions)",
+    labels = function(x) x/1000000,
+    breaks = seq(0, 10000000, 1000000)
+  ) +
+  #Add title
+  ggtitle(paste0("Prevalence (absolute number) of self-reported heart failure in the US, 1988-2023"),
+          subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents model-smoothed temporal trends and the blue shade represents its 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"))
+
+ggsave(trends_hf_n_fig,
+       filename = paste0("Figures/overall/HF Trends [Crude N].pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+
+```
+
+
+#### Sex-stratified
+
+```{r}
+trends_sex_hf_fig <- ggplot(data = hf_trends$sex$preds_df %>% 
+                              mutate(sex = str_replace_all(sex,
+                                                           c("Men" = "Male", 
+                                                             "Women" = "Female"))),
+      aes(x = year,
+          y = pe,
+          color = sex,
+          fill = sex,
+          ymin = lci,
+          ymax = uci)) +
+  #Add point estimates based on cycle-specific estimates
+  geom_pointrange(inherit.aes = F,
+                  data =  hf_trends$sex$year_df %>%
+                    filter(value == "Yes") %>% 
+                              mutate(int_factor = str_replace_all(int_factor,
+                                                           c("Men" = "Male", 
+                                                             "Women" = "Female"))),
+                  aes(x = by_var,
+                      y = prop_pe*100,
+                      ymin = prop_lci*100,
+                      ymax = prop_uci*100,
+                      color = int_factor),
+                  alpha = 0.15,
+                  fatten = 4,
+                  lwd = 1) +
+  #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.05, lwd = 0) +
+  geom_line(lwd = 1.5) +
+  geom_point(size = 4) +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Prevalence (%)",
+    breaks = seq(0, 100, 0.5)
+  ) +
+  scale_fill_stata(name = NULL) +
+  scale_color_stata(name = NULL) +
+  #Add title
+  ggtitle(paste0("Prevalence of self-reported heart failure in the US stratified by sex, 1988-2023"),
+          subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. Solid lines represent model-smoothed temporal trends and the shade represents its 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.key.width = unit(3, "cm"),
+        legend.key.height = unit(1, "cm"),
+        legend.position = c(0.1, 0.825),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 20, face = "bold"))
+
+ggsave(trends_sex_hf_fig,
+       filename = paste0("Figures/HF Trends - Sex Stratified.pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+```
+
+#### Race/Ethnicity-stratified
+
+```{r}
+trends_race_hf_fig <- ggplot(data = hf_trends$race$preds_df,
+      aes(x = year,
+          y = pe,
+          color = race_binary,
+          fill = race_binary,
+          ymin = lci,
+          ymax = uci)) +
+  #Add point estimates based on cycle-specific estimates
+  geom_pointrange(inherit.aes = F,
+                  data =  hf_trends$race$year_df %>%
+                    filter(value == "Yes"),
+                  aes(x = by_var,
+                      y = prop_pe*100,
+                      ymin = prop_lci*100,
+                      ymax = prop_uci*100,
+                      color = int_factor),
+                  alpha = 0.15,
+                  fatten = 4,
+                  lwd = 1) +
+  #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.05, lwd = 0) +
+  geom_line(lwd = 1.5) +
+  geom_point(size = 4) +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Prevalence (%)",
+    breaks = seq(0, 100, 0.5)
+  ) +
+  scale_fill_stata(name = NULL) +
+  scale_color_stata(name = NULL) +
+  #Add title
+  ggtitle(paste0("Prevalence of self-reported heart failure in the US stratified by race/ethnicity, 1988-2023"),
+          subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. Solid lines represent model-smoothed temporal trends and the shade represents its 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.key.width = unit(3, "cm"),
+        legend.key.height = unit(1, "cm"),
+        legend.position = c(0.3, 0.825),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 20, face = "bold"))
+
+ggsave(trends_race_hf_fig,
+       filename = paste0("Figures/HF Trends - Race-Ethnicity Stratified.pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+```
+
+## Trends in RFs
+
+### Multinomial
+
+#### Diabetes
+
+```{r}
+#Set up formula
+list(
+  list(
+    paste0("dm_cats", c(overall_form)),
+    overall_form
+  ),
+  list(
+    paste0("dm_cats", c(sex_form)),
+    sex_form
+  ),
+  list(
+    paste0("dm_cats", c(race_form)),
+    race_form
+  )
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep_mn, gam_rep_mn_int, gam_rep_mn_int)
+#Multinomial outcomes
+rfs_base_list$constituent_outcomes <- c("pre_dm", "dm", "pre_dm_or_dm")
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+       function(i)
+       {
+         #Use self-made function
+         rfs_base_list$trends_function[[i]](
+           survey_design = subset(sdata, hf == "Yes"),
+           data = full_data[hf == "Yes"],
+           newdata = rfs_base_list$newdata[[i]],
+           survey_weights = full_data[hf == "Yes", exam_weight],
+           model_formula =  rfs_base_list$model_formulae[[i]] %>% lapply(formula),
+           int_var = rfs_base_list$int_vars[[i]],
+           survey_replicates = subset(sdata_rep, hf == "Yes"),
+           constituent_outcomes = rfs_base_list$constituent_outcomes
+         )
+       }
+) -> dm_trends
+names(dm_trends) <- int_vars
+stopCluster(cl)
+
+
+```
+
+#### Obesity
+
+```{r}
+#Set up formula
+list(
+  list(
+    paste0("obesity_cats", c(overall_form)),
+    overall_form
+  ),
+  list(
+    paste0("obesity_cats", c(sex_form)),
+    sex_form
+  ),
+  list(
+    paste0("obesity_cats", c(race_form)),
+    race_form
+  )
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep_mn, gam_rep_mn_int, gam_rep_mn_int)
+#Multinomial outcomes
+rfs_base_list$constituent_outcomes <- c("obesity12", "obesity3", "obesity")
+
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep", 
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+       function(i)
+       {
+         #Use self-made function
+         rfs_base_list$trends_function[[i]](
+           survey_design = subset(sdata, hf == "Yes"),
+           data = full_data[hf == "Yes"],
+           newdata = rfs_base_list$newdata[[i]],
+           survey_weights = full_data[hf == "Yes", exam_weight],
+           model_formula =  rfs_base_list$model_formulae[[i]] %>% lapply(formula),
+           int_var = rfs_base_list$int_vars[[i]],
+           survey_replicates = subset(sdata_rep, hf == "Yes"),
+           constituent_outcomes = rfs_base_list$constituent_outcomes
+         )
+       }
+) -> obesity_trends
+names(obesity_trends) <- int_vars
+stopCluster(cl)
+Sys.time() - start_time
+
+```
+
+#### HTN-related
+
+##### Elevated BP
+
+```{r}
+#Set up formula
+list(
+  list(
+    paste0("htn_cats", c(overall_form)),
+    overall_form
+  ),
+  list(
+    paste0("htn_cats", c(sex_form)),
+    sex_form
+  ),
+  list(
+    paste0("htn_cats", c(race_form)),
+    race_form
+  )
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep_mn, gam_rep_mn_int, gam_rep_mn_int)
+#Multinomial outcomes
+rfs_base_list$constituent_outcomes <- c("htn1", "htn2", "htn")
+
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes", exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% lapply(formula),
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes"),
+              constituent_outcomes = rfs_base_list$constituent_outcomes
+            )
+          }
+) -> htn_trends
+names(htn_trends) <- int_vars
+stopCluster(cl)
+Sys.time() - start_time 
+
+```
+
+##### Elevated BP among HTN history
+
+```{r}
+
+#Set up formula
+list(
+  list(
+    paste0("htn_cats", c(overall_form)),
+    overall_form
+  ),
+  list(
+    paste0("htn_cats", c(sex_form)),
+    sex_form
+  ),
+  list(
+    paste0("htn_cats", c(race_form)),
+    race_form
+  )
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep_mn, gam_rep_mn_int, gam_rep_mn_int)
+#Multinomial outcomes
+rfs_base_list$constituent_outcomes <- c("htn1", "htn2", "htn")
+
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes" & htn_hist == "Yes"),
+              data = full_data[hf == "Yes" & htn_hist == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes" & htn_hist == "Yes", exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% lapply(formula),
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes" & htn_hist == "Yes"),
+              constituent_outcomes = rfs_base_list$constituent_outcomes
+            )
+          }
+) -> htn_pos_hist_trends
+names(htn_pos_hist_trends) <- int_vars
+stopCluster(cl)
+Sys.time() - start_time 
+
+```
+
+### Binomial
+
+####Myocardial Infarction
+
+```{r}
+#### Myocardial Infarction
+#Set up formula
+list(
+    paste0("mi", c(overall_form)),
+    paste0("mi", c(sex_form)),
+    paste0("mi", c(race_form))
+  ) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep_q",
+                          "sdata_q", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata_q, hf == "Yes"),
+              data = full_data[hf == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes", int_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep_q, hf == "Yes")
+            )
+          }
+) -> mi_trends
+names(mi_trends) <- int_vars
+stopCluster(cl)
+Sys.time() - start_time 
+```
+
+#### Lipid-related
+
+##### Hypercholesterolemia
+
+```{r}
+#Set up formula
+list(
+  paste0("hypercholesterol", c(overall_form)),
+  paste0("hypercholesterol", c(sex_form)),
+  paste0("hypercholesterol", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (binomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes", exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> hypercholesterol_trends
+names(hypercholesterol_trends) <- int_vars
+stopCluster(cl)
+Sys.time() - start_time 
+
+```
+
+
+##### LDL
+
+```{r}
+
+#Set up formula
+list(
+  paste0("hyperldl", c(overall_form)),
+  paste0("hyperldl", c(sex_form)),
+  paste0("hyperldl", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 3
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep_fast",
+                          "sdata_fast", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata_fast, hf == "Yes"),
+              data = full_data[hf == "Yes" & year <= 2020],
+              newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+              survey_weights = full_data[hf == "Yes" & year <= 2020, fast_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep_fast, hf == "Yes")
+            )
+          }
+) -> hyperldl_trends
+names(hyperldl_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+##### Triglycerides
+
+```{r}
+
+#Set up formula
+list(
+  paste0("hypertg", c(overall_form)),
+  paste0("hypertg", c(sex_form)),
+  paste0("hypertg", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+#Filter to 2020 or before 
+lapply(1:3, function(i) rfs_base_list$newdata[[i]] %>% filter(year <= 2020)) -> rfs_base_list$newdata
+
+
+#Set up basis functions
+gam_k <- 3
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep_fast",
+                          "sdata_fast", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata_fast, hf == "Yes"),
+              data = full_data[hf == "Yes" & year <= 2020],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes" & year <= 2020, fast_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep_fast, hf == "Yes")
+            )
+          }
+) -> hypertg_trends
+names(hypertg_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+#####HC history
+
+```{r}
+
+#Set up formula
+list(
+  paste0("dyslipid_hist2", c(overall_form)),
+  paste0("dyslipid_hist2", c(sex_form)),
+  paste0("dyslipid_hist2", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes", exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> dyslipid_hist2_trends
+names(dyslipid_hist2_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+#####Statin
+```{r}
+#Statins
+#Set up formula
+list(
+  paste0("statin", c(overall_form)),
+  paste0("statin", c(sex_form)),
+  paste0("statin", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+i = 1
+gam_k <- 3
+#Use self-made function
+rfs_base_list$trends_function[[i]](
+  survey_design = subset(sdata, hf == "Yes" & dyslipid_hist2 == "Yes"),
+  data = full_data[hf == "Yes"  & dyslipid_hist2 == "Yes" & year <= 2020],
+  newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+  survey_weights = full_data[hf == "Yes"  & dyslipid_hist2 == "Yes" & year <= 2020, exam_weight],
+  model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+  int_var = rfs_base_list$int_vars[[i]],
+  survey_replicates = subset(sdata_rep, hf == "Yes" & dyslipid_hist2 == "Yes")) -> statin_trends
+
+```
+
+#### HTN-related
+
+##### HTN history
+
+```{r}
+
+#Set up formula
+list(
+  paste0("htn_hist2", c(overall_form)),
+  paste0("htn_hist2", c(sex_form)),
+  paste0("htn_hist2", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 4
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes"],
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[hf == "Yes", exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> htn_hist2_trends
+names(htn_hist2_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+```
+
+##### HTN Meds 
+
+```{r}
+
+#Use fewer knots
+gam_k <- 3
+#CCB
+#Set up formula
+list(
+  paste0("ccb", c(overall_form)),
+  paste0("ccb", c(sex_form)),
+  paste0("ccb", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+i = 1
+#Use self-made function
+rfs_base_list$trends_function[[i]](
+  survey_design = subset(sdata, hf == "Yes" & htn_hist2 == "Yes"),
+  data = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020],
+  newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+  survey_weights = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020, exam_weight],
+  model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+  int_var = rfs_base_list$int_vars[[i]],
+  survey_replicates = subset(sdata_rep, hf == "Yes" & htn_hist2 == "Yes")) -> ccb_trends
+
+#ACEI/ARB
+#Set up formula
+list(
+  paste0("acei_arb", c(overall_form)),
+  paste0("acei_arb", c(sex_form)),
+  paste0("acei_arb", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+i = 1
+#Use self-made function
+rfs_base_list$trends_function[[i]](
+  survey_design = subset(sdata, hf == "Yes" & htn_hist2 == "Yes"),
+  data = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020],
+  newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+  survey_weights = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020, exam_weight],
+  model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+  int_var = rfs_base_list$int_vars[[i]],
+  survey_replicates = subset(sdata_rep, hf == "Yes" & htn_hist2 == "Yes")) -> acei_arb_trends
+
+#BB
+#Set up formula
+list(
+  paste0("bb", c(overall_form)),
+  paste0("bb", c(sex_form)),
+  paste0("bb", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+i = 1
+#Use self-made function
+rfs_base_list$trends_function[[i]](
+  survey_design = subset(sdata, hf == "Yes" & htn_hist2 == "Yes"),
+  data = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020],
+  newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+  survey_weights = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020, exam_weight],
+  model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+  int_var = rfs_base_list$int_vars[[i]],
+  survey_replicates = subset(sdata_rep, hf == "Yes" & htn_hist2 == "Yes")) -> bb_trends
+
+
+#Thiazides
+#Set up formula
+list(
+  paste0("thiazide", c(overall_form)),
+  paste0("thiazide", c(sex_form)),
+  paste0("thiazide", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+i = 1
+#Use self-made function
+rfs_base_list$trends_function[[i]](
+  survey_design = subset(sdata, hf == "Yes" & htn_hist2 == "Yes"),
+  data = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020],
+  newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+  survey_weights = full_data[hf == "Yes"  & htn_hist2 == "Yes" & year <= 2020, exam_weight],
+  model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+  int_var = rfs_base_list$int_vars[[i]],
+  survey_replicates = subset(sdata_rep, hf == "Yes" & htn_hist2 == "Yes")) -> thiazide_trends
+
+
+
+```
+
+
+###CKD-related
+
+#### CKD345/albuminuria 
+
+```{r}
+#Set up formula
+list(
+  paste0("ckd345_albumin", c(overall_form)),
+  paste0("ckd345_albumin", c(sex_form)),
+  paste0("ckd345_albumin", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 3
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes" & year <= 2020],
+              newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+              survey_weights = full_data[hf == "Yes" & year <= 2020, exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> ckd345_albumin_trends
+names(ckd345_albumin_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+#### CKD345 
+
+```{r}
+#Set up formula
+list(
+  paste0("ckd345", c(overall_form)),
+  paste0("ckd345", c(sex_form)),
+  paste0("ckd345", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 3
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes" & year <= 2020],
+              newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+              survey_weights = full_data[hf == "Yes" & year <= 2020, exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> ckd345_trends
+names(ckd345_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+#### Albuminuria 
+
+```{r}
+#Set up formula
+list(
+  paste0("albuminuria", c(overall_form)),
+  paste0("albuminuria", c(sex_form)),
+  paste0("albuminuria", c(race_form))
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+
+#Set up basis functions
+gam_k <- 3
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(3)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep",
+                          "sdata", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1:3,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = subset(sdata, hf == "Yes"),
+              data = full_data[hf == "Yes" & year <= 2020],
+              newdata = rfs_base_list$newdata[[i]] %>% filter(year <= 2020),
+              survey_weights = full_data[hf == "Yes" & year <= 2020, exam_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = subset(sdata_rep, hf == "Yes")
+            )
+          }
+) -> albuminuria_trends
+names(albuminuria_trends) <- int_vars
+stopCluster(cl)
+start_time - Sys.time()
+
+```
+
+###Age-standardized trends
+
+#### Model
+
+```{r}
+
+
+#Set up basis functions
+gam_k <- 4
+#Set up formula
+list(
+  paste0("hf", "~ s(year, k = 4) + ", "s(age, k = 4) + ", "ti(year, age, k = 3, bs = \"tp\")")
+) -> model_formulae
+rfs_base_list$model_formulae <- model_formulae
+#Trend functions (multinomial)
+rfs_base_list$trends_function <- list(gam_rep, gam_rep_int, gam_rep_int)
+rfs_base_list$constituent_outcomes <- NULL
+rfs_base_list$newdata[[1]] <- expand.grid(age = seq(20, 80, 1), year = seq(1988, 2023, 1))
+
+#Start timer
+start_time <- Sys.time()
+#Adjust as necessary
+cl <- makeCluster(1)
+clusterExport(cl=cl, list("rfs_base_list", "sdata_rep_q",
+                          "sdata_q", "gam_k", "full_data", 
+                          "multinom_wtd_mod", "get_props_ci", "get_rr_ci", 
+                          "svytotal_df", "svytotal_df_by", "r1", "r2",
+                          "softmax"))
+clusterEvalQ(cl, lapply(c("mgcv", "data.table", "dplyr", "Hmisc", "stringr", 
+                          "survey", "svrep", "msm"), library, character.only = TRUE))
+parLapply(cl,
+          1,
+          function(i)
+          {
+            #Use self-made function
+            rfs_base_list$trends_function[[i]](
+              survey_design = sdata_q,
+              data = full_data,
+              newdata = rfs_base_list$newdata[[i]],
+              survey_weights = full_data[, int_weight],
+              model_formula =  rfs_base_list$model_formulae[[i]] %>% formula,
+              int_var = rfs_base_list$int_vars[[i]],
+              survey_replicates = sdata_rep_q,
+              return_gam_object = T
+            )
+          }
+) -> hf_trends_aa
+start_time - Sys.time()
+stopCluster(cl)
+names(hf_trends_aa) <- "overall"
+
+
+
+
+```
+
+
+#### Temporal trends (1988-2023)
+
+##### Calculate
+
+```{r}
+#Obtain design matrix for desired predictions
+predict(hf_trends_aa$overall$gam_object,
+        newdata = rfs_base_list$newdata[[1]],
+        type = "lpmatrix") -> d_matrix
+
+#Get PEs
+d_matrix %*% hf_trends_aa$overall$coef -> logit_pe
+#Get vcov matrix
+d_matrix %*% hf_trends_aa$overall$vcov %*% t(d_matrix) -> logit_vcov
+
+#Get age-standardized weights
+full_data[survey_cycle == "2021 to 2023", .(weight = sum(int_weight)), by = age][
+  order(age), .(age, weight = weight/sum(weight))] -> std_weights
+#Length of vector for age-standardized weights
+weights_length <- std_weights[, length(weight)]
+
+#Loop over from 1988 to 2023
+lapply(
+  1:length(1988:2023), #Loop over years,
+  function(i) {
+    
+    #Get indidces for first and last age row in a given year
+    index1 <- (((i - 1) * weights_length) + 1)
+    index2 <- (i*weights_length)
+    
+    #Get probabilities across all ages for a given year
+    p <- plogis(logit_pe[index1:index2]) 
+    
+    #Get variance/derivative of probabilities for each age
+    var_p <- p * (1 - p)
+    #Weight variance of probabilities for each age by the respective weight
+    w_var_p <- var_p * std_weights[, weight]
+    #Get vcov matrix for age-wise predictions in a given year
+    vcov_logit <- logit_vcov[index1:index2, index1:index2]
+    #Get variance for the age-standardized prediction
+    var_std_p <- t(w_var_p) %*% vcov_logit %*% w_var_p
+    #Get SD
+    se_std_p <- sqrt(var_std_p)
+    #Get point estimate
+    std_p <- t(p) %*% std_weights[, weight]
+    #Get LCI and UCI plus the PE
+    std_ps <- as.numeric(std_p) + (c(-1.96, 0, 1.96) * as.numeric(se_std_p))
+    #Combine in a data.table
+    data.table(
+      lci = std_ps[1],
+      pe = std_ps[2],
+      uci = std_ps[3]
+    )
+  }
+) %>%
+  rbindlist -> aa_preds_df
+aa_preds_df[, year := 1988:2023]
+aa_preds_df[, (c("lci", "pe", "uci")) := lapply(.SD, function(x) x * 100),
+            .SDcols = c("lci", "pe", "uci")]
+aa_preds_df[, pe_ci := paste0(r1(pe), " (", r1(lci), " to ", r1(uci), ")")]
+
+```
+
+##### Plot
+
+```{r}
+ggplot(data = aa_preds_df,
+       aes(x = year, y = pe, ymin = lci, ymax = uci)
+       ) +
+    #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.5, lwd = 0, fill = "lightblue2") +
+  geom_line(lwd = 1.5, color = "maroon") +
+  geom_point(size = 3, color = "maroon") +
+  #Add scales
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Age-standardized prevalence (%)",
+    breaks = seq(0, 100, 0.2)
+  ) +
+  #Add title
+  ggtitle(paste0("Age-standardized prevalence of self-reported heart failure in the US, 1988-2023"),
+          subtitle = "The red line represents the temporal trend and the blue shade represents its 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 20, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.key.width = unit(3, "cm"),
+        legend.key.height = unit(1, "cm"),
+        legend.position = c(0.1, 0.825),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 20, face = "bold")) -> trends_hf_aa_fig
+
+ggsave(trends_hf_aa_fig,
+       filename = paste0("Figures/Overall/HF Trends [Age-adjusted].pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+
+
+```
+
+
+##### Risk ratio
+
+```{r}
+
+#Get indices for first and last age-group in 2023
+i = 1
+index1 <- (((i - 1) * weights_length) + 1)
+index2 <- (i*weights_length)
+
+#Get indices for first and last age-group in 2023
+i = 36
+index3 <- (((i - 1) * weights_length) + 1)
+index4 <- (i*weights_length)
+
+
+#Get probabilities for 1988 and 2023
+p <- plogis(logit_pe[c(index1:index2, index3:index4)])
+
+#Get variance
+var_p <- p * (1 - p)
+var_p <- diag(var_p)
+
+#Get VCOV of logits for 1988/2023
+vcov_logit <- logit_vcov[c(index1:index2, index3:index4), c(index1:index2, index3:index4)]
+vcov_p <- var_p %*% vcov_logit %*% var_p
+
+#Paste an expression together
+xs <- paste0("x", 1:length(p))
+# Expressions for each group
+p[1:(length(p)/2)] -> p1
+p[(1 + length(p)/2):(length(p))] -> p2
+expr_p1 <- paste0(std_weights[, weight], "*x", c(1:length(p1)), collapse = "+")
+expr_p2 <- paste0(std_weights[, weight], "*x", c((1 + length(p1)):(2*length(p2))), collapse = "+")
+full_expr <- paste0("log((", expr_p1, ")", "/", "(", expr_p2, "))")
+
+# Full log risk ratio expression
+full_expr <- paste0("log((", expr_p1, ")/(", expr_p2, "))")
+
+# Apply delta method
+deltamethod(g = parse(text = full_expr),
+            mean = c(p1, p2),
+            cov = vcov_p) -> logrr_se
+
+#Get LCI/PE/UCI
+logrr <- log(sum(p2 * std_weights[, weight])/sum(p1 * std_weights[, weight])) + c(-1.96, 0, 1.96)*logrr_se
+hf_trends_aa$overall$rr <- data.table(
+  lci = exp(logrr[1]),
+  pe = exp(logrr[2]),
+  uci = exp(logrr[3])
+)
+hf_trends_aa$overall$rr[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+
+```
+
+####Age-wise prevalence of HF
+
+#####Calculate
+
+```{r}
+#Number of unique age-groups
+rfs_base_list$newdata[[1]] %>% pull(age) %>% uniqueN -> age_n
+
+#Vector to select relevant elements (all ages in 1998 and 2023)
+selection_vector <- c(1:age_n, (length(logit_pe) - age_n + 1):length(logit_pe))
+
+#Get logit PEs and VCOV
+logit_pe[selection_vector] -> logit_pe_age
+logit_vcov[selection_vector, selection_vector] -> vcov_logit_age
+logit_se_age <- diag(vcov_logit_age) %>% sqrt
+
+#Put everything into a data.table
+hf_age_prev_df <- data.table(
+  pe = logit_pe_age %>% plogis,
+  lci = (logit_pe_age - 1.96 * logit_se_age) %>% plogis,
+  uci = (logit_pe_age + 1.96 * logit_se_age) %>% plogis
+  )
+hf_age_prev_df[, age := rfs_base_list$newdata[[1]] %>% pull(age) %>% unique %>% rep(times = 2)]
+hf_age_prev_df[, year := c(1988, 2023) %>% rep(each = nrow(hf_age_prev_df)/2)]
+
+#Round
+hf_age_prev_df[, (c("lci", "pe", "uci")) := lapply(.SD, function(x) x * 100),
+            .SDcols = c("lci", "pe", "uci")]
+hf_age_prev_df[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+
+
+```
+
+#####Plot
+```{r}
+ggplot(data = hf_age_prev_df,
+       aes(x = age, y = pe, ymin = lci, ymax = uci, 
+           color = factor(year), fill = factor(year))
+       ) +
+    #Add Lines & Ribbons
+  geom_ribbon(alpha = 0.1, lwd = 0) +
+  geom_line(lwd = 1.5) +
+  #Add scales
+  scale_x_continuous(
+    name = "Age",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Age-stratified Prevalence (%)",
+    breaks = seq(0, 100, 1)
+  ) +
+  scale_color_jama(name = "Year") +
+  scale_fill_jama(name = "Year") +
+  #Add title
+  ggtitle(paste0("Prevalence of self-reported heart failure in the US across the spectrum of age, 1988-2023"),
+          subtitle = "Solid lines represents the point estimates and the shades represents the 95% CI.") +
+  #Theme
+  theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        legend.key.width = unit(3, "cm"),
+        legend.key.height = unit(1, "cm"),
+        legend.position = c(0.1, 0.825),
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 20, face = "bold")) -> hf_age_strat_fig
+
+ggsave(hf_age_strat_fig,
+       filename = paste0("Figures/Overall/HF Trends [Age-stratified].pdf"),
+     width = 16, height = 9,
+     dpi = 600)
+
+```
+
+
+### REV
+
+```{r}
+#Predictions
+full_data[, aa_preds := predict(hf_trends_aa$overall$gam_object, 
+                                full_data[, .(age, year)],
+                                type = "lpmatrix") %*% (hf_trends_aa$overall$coef)]
+
+#REV due to year
+gam(data = full_data,
+   weights = int_weight,
+   aa_preds ~ s(age, k = 4)) %>%
+  summary %>%
+  {1 - .$dev.expl} -> year_rexvar
+
+#REV due to age
+gam(data = full_data,
+    weights = int_weight,
+    aa_preds ~ s(year, k = 4)) %>%
+  summary %>%
+  {1 - .$dev.expl} -> age_rexvar
+
+
+```
+
+### RF Figures
+
+#### Line graphs
+
+```{r}
+#Outer loop (over overall/race/sex)
+lapply(int_vars,
+       function(int_var) {
+
+list("albuminuria" = albuminuria_trends[[int_var]], 
+     "a reduced eGFR" = ckd345_trends[[int_var]],
+     "chronic kidney disease" = ckd345_albumin_trends[[int_var]],
+     "diabetes" = dm_trends[[int_var]]$dm,
+     "prediabetes" = dm_trends[[int_var]]$pre_dm,
+     "diabetes or pre-diabetes" = dm_trends[[int_var]]$pre_dm_or_dm,
+     "obesity" = obesity_trends[[int_var]]$obesity,
+     "class I or II obesity" = obesity_trends[[int_var]]$obesity12,
+     "class III obesity" = obesity_trends[[int_var]]$obesity3,
+     "elevated blood pressure" = htn_trends[[int_var]]$htn,
+     "stage 1 hypertension" = htn_trends[[int_var]]$htn1,
+     "stage 2 hypertension" = htn_trends[[int_var]]$htn2,
+     "a history of hypertension" = htn_hist2_trends[[int_var]],
+     "hypercholesterolemia" = hypercholesterol_trends[[int_var]], 
+     "a history of hypercholesterolemia" = dyslipid_hist2_trends[[int_var]], 
+     "elevated low-density lipoprotein cholesterol" = hyperldl_trends[[int_var]],
+     "hypertriglyceridemia" = hypertg_trends[[int_var]],
+     "a previous myocardial infarction" = mi_trends[[int_var]]) -> list_for_rf_figs
+
+
+#Inner loop (over outcomes)
+#Loop over the different items
+lapply(1:length(list_for_rf_figs),
+       function(i) {
+         
+       #Get plot label
+       plot_label <- names(list_for_rf_figs[i])
+       
+       #Get list object by index
+       list_object <- list_for_rf_figs[[i]]
+       
+       if(int_var == "sex") {
+         list_object$preds_df[, sex := str_replace(sex, "Men", "Males")]
+         list_object$preds_df[, sex := str_replace(sex, "Women", "Females")]
+         list_object$year_df[, int_factor := str_replace(int_factor, "Men", "Males")]
+         list_object$year_df[, int_factor := str_replace(int_factor, "Women", "Females")]
+         }
+       
+       
+       main_layer <- if(int_var == "overall") {
+         ggplot(data = list_object$preds_df,
+                aes(x = year,
+                    y = pe,
+                    ymin = lci,
+                    ymax = uci)) +
+           #Add point estimates based on cycle-specific estimates
+           geom_pointrange(inherit.aes = F,
+                           data = list_object$year_df,
+                           aes(x = by_var,
+                               y = prop_pe*100,
+                               ymin = prop_lci*100,
+                               ymax = prop_uci*100),
+                           color = "grey10",
+                           alpha = 0.4,
+                           fatten = 4,
+                           lwd = 1) +
+           #Add Lines & Ribbons
+           geom_ribbon(alpha = 0.5, lwd = 0, fill = "lightblue2") +
+           geom_line(lwd = 1.5, color = "maroon") +
+           geom_point(size = 3, color = "maroon") +
+           
+           #Add text annotation
+           annotate(geom = "text",
+                    size = 10*0.5,
+                    fontface = "bold",
+                    x = -Inf, y = Inf,
+                    hjust = -0.1,
+                    vjust = 1.4,
+                    label = paste0(
+                      list_object$preds_df[1, pe %>% round(1) %>% format(nsmall = 1)],
+                      "% in 1988 to ",
+                      list_object$preds_df[nrow(list_object$preds_df), pe %>% round(1) %>% format(nsmall = 1)], 
+                      "% in ", list_object$preds_df[nrow(list_object$preds_df), year]
+                    )
+           )
+       } else {
+         ggplot(data = list_object$preds_df,
+                aes(x = year,
+                    y = pe,
+                    ymin = lci,
+                    ymax = uci,
+                    color = !!as.symbol(int_var),
+                    fill = !!as.symbol(int_var)
+                    )) +
+           #Add point estimates based on cycle-specific estimates
+           geom_pointrange(inherit.aes = F,
+                           data = list_object$year_df,
+                           aes(x = by_var,
+                               y = prop_pe*100,
+                               color = int_factor,
+                               ymin = prop_lci*100,
+                               ymax = prop_uci*100),
+                           alpha = 0.4,
+                           fatten = 4,
+                           lwd = 1) +
+           #Add Lines & Ribbons
+           geom_ribbon(alpha = 0.1, color = "transparent", lwd = 0) +
+           geom_line(lwd = 1.5) +
+           geom_point(size = 3) +
+           scale_color_jama(name = NULL) +
+           scale_fill_jama(name = NULL)
+       }
+       
+       
+  #Plot! 
+  trends_fig <- main_layer +
+    #Add scales
+    scale_x_continuous(
+      name = "Year",
+      breaks = seq(0, 5000, 2),
+      expand = c(0.02, 0.0)
+    ) +
+    scale_y_continuous(
+      name = "Prevalence (%)",
+      breaks = seq(0, 100, 5)
+    ) +
+    #Add title
+    ggtitle(paste0("Prevalence of ", plot_label, " among patients with heart failure in the US, 1988-", list_object$preds_df[, max(year)]),
+            subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents model-smoothed temporal trends and the blue shade represents its 95% CI.") +
+    #Theme
+    theme_bw() +
+    theme(text = element_text(size = 23),
+          plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+          plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+          axis.text.x = element_text(size = 20, face = "bold"),
+          axis.text.y = element_text(size = 20, face = "bold"),
+          axis.title.x = element_text(size = 25, face = "bold"),
+          axis.title.y = element_text(size = 25, face = "bold"),
+          axis.line = element_line(colour = "black", linewidth = 1.2),
+          plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+          legend.key.width = unit(3, "cm"),
+          legend.key.height = unit(1, "cm"),
+          legend.position = "top",
+          legend.background = element_rect(fill = "transparent"),
+          legend.key = element_rect(fill = "transparent"),
+          legend.title = element_text(size = 20, face = "bold"),
+          legend.text = element_text(size = 20, face = "bold"))
+  
+  #Save
+  ggsave(trends_fig,
+         filename = paste0("Figures/", int_var, "/Trends in ", plot_label, " [", int_var, "].pdf"),
+         width = 16, height = 9,
+         dpi = 600)
+  
+  #Save object in list
+  trends_fig
+}) -> trends_fig_rfs
+
+#Name list
+names(trends_fig_rfs) <- names(list_for_rf_figs)
+
+#Return
+trends_fig_rfs
+
+       }
+
+
+) -> trends_fig_rfs
+
+names(trends_fig_rfs) <- int_vars
+
+```
+
+
+#### Cumulative figures
+
+```{r}
+
+
+list(
+  "insulin resistance" = list(
+    "Diabetes" = dm_trends$overall$dm$preds_df,
+    "Prediabetes" = dm_trends$overall$pre_dm$preds_df,
+    "No diabetes or prediabetes" = dm_trends$overall$baseline$preds_df
+     ),
+  "obesity" = list(
+    "Class III obesity" = obesity_trends$overall$obesity3$preds_df,
+    "Class I or II obesity" = obesity_trends$overall$obesity12$preds_df,
+    "No obesity" = obesity_trends$overall$baseline$preds_df),
+    "elevated blood pressure" = list(
+      "Stage 1 hypertension" = htn_trends$overall$htn1$preds_df,
+      "Stage 2 hypertension" = htn_trends$overall$htn2$preds_df,
+      "Normal blood pressure" = htn_trends$overall$baseline$preds_df
+  )
+  ) -> list_for_cum_figs
+
+lapply(1:length(list_for_cum_figs),
+       function(i) {
+         
+         
+         #label
+         label <- names(list_for_cum_figs)[i]
+         
+         #Save factor order in the same way lists are ordered
+         factor_order <- names(list_for_cum_figs[[i]])
+         #Name outcome categories
+         lapply(1:length(list_for_cum_figs[[i]]),
+                function(i2)
+                list_for_cum_figs[[i]][[i2]][, cat := names(list_for_cum_figs[[i]])[[i2]]]
+                ) -> list_for_cum_figs[[i]]
+         
+         
+         #Bind list components into a single data.table
+         cum_fig_df <- list_for_cum_figs[[i]] %>% rbindlist
+         cum_fig_df[, cat := factor(cat, factor_order)]
+         
+         
+         ggplot(data = cum_fig_df,
+                aes(x = year,
+                    y = pe,
+                    fill = cat)) +
+           geom_area(lwd = 1, color = "black") +
+           ggtitle(paste0("Changes in the prevalence of ", label, " among patients with heart failure in the US, 1988 to 2023")) +
+           scale_y_continuous(expand = c(0, 0),
+                              name = "Prevalence (%)",
+                              limits = c(0, 101),
+                              breaks = seq(10, 100, 10),
+                              sec.axis = dup_axis(name = "Prevalence (%)")
+                              ) +
+           scale_x_continuous(expand = c(0, 0),
+                              name = "Year",
+                              breaks = seq(0, 5000, 2),
+                              limits = c(1988, 2023)) +
+           scale_fill_jama(name = NULL) +
+           theme_bw() +
+           theme(text = element_text(size = 23, face = "bold"),
+                 plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+                 axis.text.x = element_text(size = 20, face = "bold"),
+                 axis.text.y = element_text(size = 20, face = "bold"),
+                 axis.title.x = element_text(size = 25, face = "bold"),
+                 axis.title.y = element_text(size = 25, face = "bold"),
+                 axis.line = element_line(colour = "black", size = 0),
+          plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+                 panel.grid = element_blank(),
+                 legend.position = "bottom",
+                 legend.key.width = unit(4, "cm"),
+                 legend.key.height = unit(0.8, "cm")
+                 ) -> cum_fig
+              
+         #Save
+         ggsave(cum_fig,
+                filename = paste0("Figures/overall/Cumulative figure for ", label, ".pdf"),
+                dpi = 600,
+                width = 16, height = 9)
+         
+         #Return
+         cum_fig
+       } 
+       ) -> cum_figs
+
+names(cum_figs) <- names(list_for_cum_figs)
+
+
+```
+
+
+### Med figures
+
+```{r}
+
+
+
+#Create list containing medication trends
+list("use of ACEis or ARBs" = acei_arb_trends, 
+    "use of beta-blockers" = bb_trends, 
+    "use of calcium channel blockers" = ccb_trends, 
+    "use of thiazides" = thiazide_trends, 
+    "use of statins" = statin_trends
+    ) -> list_for_med_figs
+
+
+#Inner loop (over outcomes)
+#Loop over the different items
+lapply(1:length(list_for_med_figs),
+      function(i) {
+        
+        #Get plot label
+        plot_label <- names(list_for_med_figs[i])
+        
+        #Get list object by index
+        list_object <- list_for_med_figs[[i]]
+        
+        
+        #Plot! 
+        trends_fig <- ggplot(data = list_object$preds_df,
+                             aes(x = year,
+                                 y = pe,
+                                 ymin = lci,
+                                 ymax = uci)) +
+          #Add point estimates based on cycle-specific estimates
+          geom_pointrange(inherit.aes = F,
+                          data = list_object$year_df,
+                          aes(x = by_var,
+                              y = prop_pe*100,
+                              ymin = prop_lci*100,
+                              ymax = prop_uci*100),
+                          color = "grey10",
+                          alpha = 0.4,
+                          fatten = 4,
+                          lwd = 1) +
+          #Add Lines & Ribbons
+          geom_ribbon(alpha = 0.5, lwd = 0, fill = "lightblue2") +
+          geom_line(lwd = 1.5, color = "maroon") +
+          geom_point(size = 4, color = "maroon") +
+          
+          #Add text annotation
+          annotate(geom = "text",
+                   size = 10*0.5,
+                   fontface = "bold",
+                   x = -Inf, y = Inf,
+                   hjust = -0.1,
+                   vjust = 1.4,
+                   label = paste0(
+                     list_object$preds_df[1, pe %>% round(1) %>% format(nsmall = 1)],
+                     "% in 1988 to ",
+                     list_object$preds_df[nrow(list_object$preds_df), pe %>% round(1) %>% format(nsmall = 1)], 
+                     "% in ", list_object$preds_df[nrow(list_object$preds_df), year]
+                   )
+          ) +
+          #Add scales
+          scale_x_continuous(
+            name = "Year",
+            breaks = seq(0, 5000, 2),
+            expand = c(0.02, 0.0)
+          ) +
+          scale_y_continuous(
+            name = "Prevalence (%)",
+            breaks = seq(0, 100, 5)
+          ) +
+          #Add title
+          ggtitle(paste0("Prevalence of ", plot_label, " among patients with heart failure in the US, 1988-2020"),
+                  subtitle = "Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents model-smoothed temporal trends and the blue shade represents its 95% CI.") +
+          #Theme
+          theme_bw() +
+          theme(text = element_text(size = 23),
+                plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+                plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+                axis.text.x = element_text(size = 20, face = "bold"),
+                axis.text.y = element_text(size = 20, face = "bold"),
+                axis.title.x = element_text(size = 25, face = "bold"),
+                axis.title.y = element_text(size = 25, face = "bold"),
+                axis.line = element_line(colour = "black", linewidth = 1.2),
+                plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+                legend.key.width = unit(3, "cm"),
+                legend.key.height = unit(1, "cm"),
+                legend.position = "top",
+                legend.background = element_rect(fill = "transparent"),
+                legend.key = element_rect(fill = "transparent"),
+                legend.title = element_text(size = 20, face = "bold"),
+                legend.text = element_text(size = 20, face = "bold"))
+        
+        #Save
+        ggsave(trends_fig,
+               filename = paste0("Figures/overall", "/Trends in ", plot_label, ".pdf"),
+               width = 16, height = 9,
+               dpi = 600)
+        
+        #Save object in list
+        trends_fig
+      }) -> trends_fig_meds
+
+#Name list
+names(trends_fig_meds) <- names(list_for_med_figs)
+
+
+
+
+```
+
+##Collate multipanel figures
+
+###Rescale
+
+```{r}
+rescale_ggplot <-
+  theme(
+  plot.title = element_text(size = 7, face = "bold", color = "transparent", hjust = 0),
+  plot.subtitle = element_blank(),
+  axis.text.x = element_text(size = rel(0.55), face = "bold"),
+  axis.text.y = element_text(size = rel(0.7), face = "bold"),
+  axis.title.x = element_blank(),
+  axis.title.y = element_text(size = rel(0.6), face = "bold"),
+  axis.line = element_line(colour = "black", linewidth = 1.2),
+  legend.key.width = unit(rel(0.5), "cm"),
+  legend.key.height = unit(rel(0.5), "cm"),
+  legend.text = element_text(size = rel(0.5), face = "bold")
+  )
+
+```
+
+###HF prevalence
+
+```{r}
+
+#HF
+hf_figure_labels <- c(
+  "[A] Crude prevalence (proportion)",
+  "[B] Crude prevalence (absolute number)",
+  "[C] Age-standardized prevalence",
+  "[D] Age-stratified prevalence"
+)
+ggarrange(trends_hf_fig + rescale_ggplot, 
+          trends_hf_n_fig  + rescale_ggplot,
+          trends_hf_aa_fig + rescale_ggplot, 
+          hf_age_strat_fig + rescale_ggplot,
+          labels = hf_figure_labels,
+          ncol = 2, nrow = 2,
+          font.label = list(size = 15),
+          hjust = -0.01)
+
+grid_2by2(width = 3)
+hf_panels_fig <- grid.grab()
+ggsave(hf_panels_fig,
+       filename = paste0("Figures/overall/Figure 1.pdf"),
+       width = 16,
+       height = 9,
+       dpi = 600)
+
+
+```
+
+###HTN
+
+```{r}
+
+#HTN
+htn_figure_labels <- c(
+  "[A] Elevated blood pressure (Stage 1 or 2 hypertension)",
+  "[B] Stage 1 hypertension",
+  "[C] Stage 2 hypertension",
+  "[D] Cumulative prevalence"
+)
+ggarrange(trends_fig_rfs$overall$`elevated blood pressure` + rescale_ggplot, 
+          trends_fig_rfs$overall$`stage 1 hypertension` + rescale_ggplot, 
+          trends_fig_rfs$overall$`stage 2 hypertension` + rescale_ggplot,
+          cum_figs$`elevated blood pressure`  + rescale_ggplot,
+          labels = htn_figure_labels,
+          ncol = 2, nrow = 2,
+          font.label = list(size = 15),
+          hjust = -0.01)
+
+grid_2by2(width = 3)
+htn_panels_fig <- grid.grab()
+ggsave(htn_panels_fig,
+       filename = paste0("Figures/overall/Figure 2.pdf"),
+       width = 16,
+       height = 9,
+       dpi = 600)
+
+
+```
+
+###Obesity
+
+```{r}
+#Obesity
+obesity_figure_labels <- c(
+  "[A] Obesity (class I-III)",
+  "[B] Class I/II obesity",
+  "[C] Class III obesity",
+  "[D] Cumulative prevalence"
+)
+ggarrange(trends_fig_rfs$overall$obesity + rescale_ggplot, 
+          trends_fig_rfs$overall$`class I or II obesity` + rescale_ggplot, 
+          trends_fig_rfs$overall$`class III obesity` + rescale_ggplot,
+          cum_figs$obesity  + rescale_ggplot,
+          labels = obesity_figure_labels,
+          ncol = 2, nrow = 2,
+          font.label = list(size = 15),
+          hjust = -0.01)
+
+grid_2by2(width = 3)
+obesity_panels_fig <- grid.grab()
+ggsave(obesity_panels_fig,
+       filename = paste0("Figures/overall/Figure 3.pdf"),
+       width = 16,
+       height = 9,
+       dpi = 600)
+
+```
+
+###Diabetes
+
+```{r}
+#DM
+obesity_figure_labels <- c(
+  "[A] Diabetes or prediabetes",
+  "[B] Prediabetes",
+  "[C] Diabetes",
+  "[D] Cumulative prevalence"
+)
+ggarrange(trends_fig_rfs$overall$`diabetes or pre-diabetes` + rescale_ggplot, 
+          trends_fig_rfs$overall$prediabetes + rescale_ggplot, 
+          trends_fig_rfs$overall$diabetes + rescale_ggplot,
+          cum_figs$`insulin resistance`  + rescale_ggplot,
+          labels = obesity_figure_labels,
+          ncol = 2, nrow = 2,
+          font.label = list(size = 15),
+          hjust = -0.01)
+
+grid_2by2(width = 3)
+dm_panels_fig <- grid.grab()
+ggsave(dm_panels_fig,
+       filename = paste0("Figures/overall/Figure 4.pdf"),
+       width = 16,
+       height = 9,
+       dpi = 600)
+
+```
+
+###Cholesterol/MI/CKD
+
+```{r}
+#Figure 5 labels
+figure5_labels <- c(
+  "[A] Hypercholesterolemia",
+  "[A] Elevated LDL-C",
+  "[C] Myocardial infarction",
+  "[D] Chronic kidney disease"
+)
+ggarrange(trends_fig_rfs$overall$hypercholesterolemia + rescale_ggplot, 
+          trends_fig_rfs$overall$`elevated low-density lipoprotein cholesterol` + rescale_ggplot, 
+          trends_fig_rfs$overall$`a previous myocardial infarction` + rescale_ggplot, 
+          trends_fig_rfs$overall$`chronic kidney disease` + rescale_ggplot,
+          labels = figure5_labels,
+          ncol = 2, nrow = 2,
+          font.label = list(size = 15),
+          hjust = -0.01)
+
+grid_2by2(width = 3)
+f5_panels_fig <- grid.grab()
+ggsave(f5_panels_fig,
+       filename = paste0("Figures/overall/Figure 5.pdf"),
+       width = 16,
+       height = 9,
+       dpi = 600)
+
+```
+
+##Difference in ORs
+
+###Model
+
+
+```{r}
+#Load some packages necessary for this part.
+library(emmeans)
+library(rms)
+
+#Function to round P-values (of interaction)
+p <- function(p) ifelse(p < 0.001, "<0.001", round(p, 3) %>% format(nsmall = 3))
+
+#Function to get ORs for HF and non-HF and difference in ORs
+or_diff <- function(outcome, survey_design_name) {
+  
+  
+  #Set formula
+  reg_formula <- as.formula(paste0(outcome, " ~ hf*year + rcs(age, 5) + sex"))
+#Regress
+svyglm(
+  design = get(survey_design_name),
+  family = binomial,
+  formula = reg_formula) -> m
+
+#Get HF-stratified ORs
+emmeans(m, 
+        data = full_data,
+        trt.vs.ctrl ~ year|hf,#Contrasts of interest
+        at = list(year = c(1980, 1990), #OR per 10-year change
+                  hf = c("No", "Yes"))) -> comp
+
+#Capture double differences
+comp %>% 
+  pairs %>%
+  pairs(by = NULL) %>%
+  confint %>%
+  data.frame %>%
+  rename(any_of(
+                c("dd_pe" = "estimate",
+                  "dd_lci" = "asymp.LCL",
+                  "dd_uci" = "asymp.UCL"))) %>%
+              mutate(across(.cols = c("dd_pe", "dd_lci", "dd_uci"), #Exponentiate
+                  ~ . %>% exp)) %>%
+  select(dd_pe, dd_lci, dd_uci) %>%
+  data.table -> dd_df
+
+
+
+#Collect in a data.frame
+comp$contrasts %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  rename(any_of(
+                c("pe" = "estimate",
+                  "lci" = "asymp.LCL",
+                  "uci" = "asymp.UCL"))) %>%
+              mutate(across(.cols = c("pe", "lci", "uci"), #Exponentiate
+                  ~ . %>% exp)) %>%
+  select(hf, pe, lci, uci) %>%
+  data.table -> comp
+
+
+#Add p-value for interaction
+comp[, pint := regTermTest(m, "hf:year")$p %>% as.numeric %>% p]
+
+#Assign outcome
+comp[, outcome := outcome]
+
+#Create PE-CI
+comp[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+
+
+#Flip if necessary (for reductions)
+if(all(comp$pe < 1)) {
+  dd_df[, dd_pe := 1/dd_pe]
+  dd_df[, (c("dd_uci", "dd_lci")) := .(1/dd_lci, 1/dd_uci)]
+  }
+
+#Combine with dd_df
+comp <- cbind(comp, dd_df)
+
+#Create PE-CI for double differences
+comp[, dd_pe_ci := paste0(r2(dd_pe), " (", r2(dd_lci), " to ", r2(dd_uci), ")")]
+
+#Return
+comp
+}
+
+
+#Loop over desired outcomes
+mapply(or_diff, outcome = c("htn", "obesity", "dm",
+                            "mi", "ckd345_albumin", 
+                            "hypercholesterol", "hyperldl", "hypertg"), 
+       survey_design_name = c("sdata", "sdata", "sdata",
+                              "sdata_q", "sdata", 
+                              "sdata", "sdata_fast", "sdata_fast"),
+       SIMPLIFY = F) -> or_diff_df
+or_diff_df <- rbindlist(or_diff_df)
+
+
+```
+
+###Forest plot
+
+#### Function to beautify forest
+
+```{r}
+#Get aesthetics for forest plot
+forestploter_aes <- function(forest = forest, fp_df,
+                             col_names = TRUE, specific_rows = TRUE,
+                             marker = "header") {
+  ##Header aesthetics
+  if(col_names == TRUE) {
+    
+    #Underline headers
+    forest <- add_underline(plot = forest, part = "header")
+    
+    # Bold column headers text
+    forest <- edit_plot(forest,
+                        part = "header",
+                        gp = gpar(fontface = "bold"))
+  }
+  
+  #Specific row aesthetics
+  if(specific_rows == TRUE) {
+    # Bold specific rows
+    forest <- edit_plot(forest,
+                        part = "body",
+                        gp = gpar(fontface = "bold"),
+                        row = fp_df[, marker] %>% pull %>% which)
+    
+    forest <- add_underline(forest, 
+                            row = c(fp_df[, marker] %>% pull %>% which, 
+                                    fp_df[, marker] %>% pull %>% which %>% {.-1}))
+    
+      }
+  
+}
+
+```
+
+#### Function to create forest
+
+```{r}
+
+#Grouped forest plot
+grouped_fp <- function(forest_df, variable, grouping_variable,
+                       title,
+                       footnote,
+                       space,
+                       n_rows,
+                       es_label,
+                       xlog,
+                       xlimits = c(0.4, 2.5), 
+                       xticks = c(0.4, 0.5, 1, 2, 2.5),
+                       size = 13) {
+  
+  #Set theme
+  fp_theme <- forest_theme(base_size = size,
+                           title_cex = 1.5,
+                           footnote_cex = 0.7,
+                           refline_lwd = 2,
+                           xaxis_lwd = 2,
+                           xaxis_cex = 1,
+                           ci_pch = 15,
+                           ci_Theight = 0.25,
+                           ci_col = "black",
+                           title_just = "center",
+                           colhead = list(
+                             fg_params = list(hjust = 0.5, 
+                                              x = c(0.5, 0.5, 0.5)))
+  )
+  
+  
+  #Arrange according to outcomes
+  forest_df <- arrange(forest_df, get(grouping_variable))
+  
+  #Identify unique grouping variable indices
+  grouping_indices <- which(forest_df[, get(grouping_variable)] %>% {!duplicated(.)})
+  
+  #Lapply to create header rows
+  lapply(grouping_indices,
+         function(i)
+           rbind(tibble(!!as.symbol(grouping_variable) := forest_df[i, get(grouping_variable)]) %>% data.table, 
+                 forest_df[i:(i + (n_rows - 1) ),],
+                 fill = T)
+  ) %>% rbindlist -> forest_df
+  
+  
+  #Combine variable and grouping_variable in same column
+  forest_df[, var := fifelse(is.na(pe_ci), get(grouping_variable) %>% as.character, get(variable))]
+  
+  forest_df[!is.na(pint), pint %>% unique, by = get(grouping_variable)][, V1] -> pints
+  
+  #Assign P for interaction
+  forest_df[, pint := NULL]
+  forest_df[is.na(pe_ci), pint := pints]
+  forest_df[!is.na(pe_ci), pint := ""]
+  
+  #Assign headings
+  forest_df[, heading := fifelse(is.na(pe_ci), TRUE, FALSE)]
+  
+  #Pad
+  forest_df[, var := paste0(var, "      ")]
+  forest_df[!is.na(pe_ci), var := paste0("      ", var)]
+  
+  
+  #Remake into data.frame
+  data.frame(forest_df) -> forest_df
+  #Replace NAs
+  forest_df[is.na(forest_df)] <- ""
+  
+  #Insert empty column for FP plotting space
+  forest_df$"space" <- paste(rep(" ", space), collapse = " ")
+  
+  #Columns to get
+  fp_cols <- c(
+    which(colnames(forest_df) == "var"),
+    length(forest_df),
+    which(colnames(forest_df) == "pe_ci"),
+    which(colnames(forest_df) == "pint"),
+    which(colnames(forest_df) == "dd_pe_ci")
+  )
+  
+  
+  #Forest
+  forest <- forest(data = forest_df %>%
+                     dplyr::select(fp_cols) %>%
+                     rename("Variable/outcome" = var,
+                            "  " = space,
+                            !!as.symbol(es_label) := pe_ci,
+                            "P-value for interaction" = pint,
+                            "Ratio of ratios (95% CI)**" = dd_pe_ci),
+                   #Labels and est/ci
+                   est = forest_df$pe  %>% as.numeric,
+                   ci_column = 2,
+                   lower = forest_df$lci %>% as.numeric,
+                   upper = forest_df$uci %>% as.numeric,
+                   #Box Aesthetics,
+                   sizes = 5,
+                   #X-axis
+                   ticks_at = xticks,
+                   xlog = xlog,
+                   xlim = xlimits,
+                   #Title,
+                   title = title,
+                   footnote = footnote,
+                   #Theme
+                   theme = fp_theme
+  )
+  
+  library(grid)
+  forest_df <- tibble(forest_df)
+  forestploter_aes(forest, fp_df = forest_df, marker = "heading") -> forest
+  forest
+  
+}
+
+
+```
+
+#### Plot
+
+```{r}
+#Load forestploter package
+library(forestploter)
+
+#Coerce to character
+or_diff_df[, hf := as.character(hf)]
+
+#Replace outcome names
+c(
+   "htn" = "Elevated blood pressure",
+   "obesity" = "Obesity",
+  "dm" = "Diabetes",
+  "hypercholesterol" = "Hypercholesterolemia",
+  "hyperldl" = "Elevated LDL Cholesterol",
+  "hypertg" = "Hypertriglyceridemia",
+  "^mi$" = "Myocardial Infarction",
+  "ckd345_albumin" = "Chronic kidney disease"
+) -> replacement_string
+or_diff_df[, outcome := str_replace_all(outcome, replacement_string)]
+
+
+#Reorder
+or_diff_df[, outcome]
+or_diff_df[, outcome := factor(outcome, levels = replacement_string)]
+
+#Remove second ratio of ratios row
+or_diff_df[seq(1, nrow(or_diff_df), 2), dd_pe_ci := ""]
+
+#Replace yes/no
+or_diff_df[, hf := str_replace_all(hf, c("Yes"  =  "HF present",
+                                          "No" = "HF absent"))]
+
+#Forest
+grouped_fp(
+  forest_df = or_diff_df,
+  variable = "hf", grouping_variable = "outcome",
+  title = "Differences in temporal trends of risk factors between respondents with and without heart failure",
+  footnote = "\n*Odds ratios (OR) are per 10-year increments and are adjusted for age and sex.\n**This ratio quantifies the extent to which a given increase or decrease was greater in degree among respondents with heart failure compared to respondents without heart failure",
+  n_rows = 2,
+  space = 50,
+  es_label = "Odds ratio (95% CI)*",
+  size = 15,
+  xlog = T
+) -> forest_fig_binary
+
+#Save
+ggsave(filename = "Figures/Overall/Forest Figure [Binary].pdf",
+       forest_fig_binary,
+       dpi = 600,
+       width = 16, height = 9
+       )
+
+```
+
+##Mean differences
+
+###Model
+
+```{r}
+
+
+# outcome <- "bmi"
+# survey_design_name <- "sdata"
+#Function to get ORs for HF and non-HF and difference in MDs
+mean_diff <- function(outcome, survey_design_name) {
+  
+  
+  #Set formula
+  reg_formula <- as.formula(paste0(outcome, " ~ hf*year + rcs(age, 5) + sex"))
+#Regress
+svyglm(
+  design = get(survey_design_name),
+  formula = reg_formula) -> m
+
+#Get HF-stratified MDs
+emmeans(m, 
+        data = full_data,
+        trt.vs.ctrl ~ year|hf,#Contrasts of interest
+        at = list(year = c(1980, 1990), #MD per 10-year change
+                  hf = c("No", "Yes"))) -> comp
+
+#Capture double differences
+comp %>% 
+  pairs %>%
+  pairs(by = NULL) %>%
+  confint %>%
+  data.frame %>%
+  rename(any_of(
+                c("dd_pe" = "estimate",
+                  "dd_lci" = "lower.CL",
+                  "dd_uci" = "upper.CL"))) %>%
+  select(dd_pe, dd_lci, dd_uci) %>%
+  data.table -> dd_df
+
+#Collect in a data.frame
+comp$contrasts %>%
+  confint(adjust = "none") %>%
+  data.frame %>%
+  rename(any_of(
+                c("pe" = "estimate",
+                  "lci" = "lower.CL",
+                  "uci" = "upper.CL"))) %>%
+  select(hf, pe, lci, uci) %>%
+  data.table -> comp
+
+
+#Add p-value for interaction
+comp[, pint := regTermTest(m, "hf:year")$p %>% as.numeric %>% p]
+
+#Assign outcome
+comp[, outcome := outcome]
+
+#Create PE-CI
+comp[, pe_ci := paste0(r2(pe), " (", r2(lci), " to ", r2(uci), ")")]
+
+
+#Flip if necessary (for reductions)
+if(all(comp$pe < 0)) {
+  dd_df[, dd_pe := -dd_pe]
+  dd_df[, (c("dd_uci", "dd_lci")) := .(-dd_lci, -dd_uci)]
+  }
+
+#Combine with dd_df
+comp <- cbind(comp, dd_df)
+
+#Create PE-CI for double differences
+comp[, dd_pe_ci := paste0(r2(dd_pe), " (", r2(dd_lci), " to ", r2(dd_uci), ")")]
+
+#Return
+comp
+}
+
+
+#Loop over desired outcomes
+mapply(mean_diff, outcome = c("sbp", "dbp",
+                              "bmi",
+                              "hba1c",
+                              "tc", "ldl", "tg",
+                              "egfr", "uacr"), 
+       survey_design_name = c("sdata", "sdata",
+                              "sdata",
+                              "sdata",
+                              "sdata", "sdata_fast", "sdata_fast",
+                              "sdata", "sdata"),
+       SIMPLIFY = F) -> mean_diff_df
+mean_diff_df <- rbindlist(mean_diff_df)
+
+```
+
+###Tabulate
+
+```{r}
+
+#Coerce HF to character
+mean_diff_df[, hf := as.character(hf)]
+
+#Replace outcome names
+c(
+   "sbp" = "Systolic blood pressure (mmHg)",
+   "dbp" = "Diastolic blood pressure (mmHg)",
+   "bmi" = "Body mass index (kg/m²)",
+  "hba1c" = "HbA1c (%)",
+  "tc" = "Total cholesterol (mg/dL)",
+  "ldl" = "LDL Cholesterol (mg/dL)",
+  "tg" = "Triglycerides (mg/dL)",
+  "egfr" = "eGFR (mL/min/1.73m²)",
+  "uacr" = "Urine albumin-creatinine ratio (mg/g)"
+) -> replacement_string
+mean_diff_df[, outcome := str_replace_all(outcome, replacement_string)]
+
+
+#Reorder
+mean_diff_df[, outcome := factor(outcome, levels = replacement_string)]
+
+#Remove second ratio of ratios row
+mean_diff_df[seq(1, nrow(mean_diff_df), 2), dd_pe_ci := ""]
+mean_diff_df[seq(1, nrow(mean_diff_df), 2), pint := ""]
+
+#Replace yes/no
+mean_diff_df[, hf := str_replace_all(hf, c("Yes"  =  "HF present",
+                                          "No" = "HF absent"))]
+
+#Forest
+# grouped_fp(
+#   forest_df = mean_diff_df,
+#   variable = "hf", grouping_variable = "outcome",
+#   title = "Average temporal difference in average levels of different risk markers in respondents with or without heart failure",
+#   footnote = "\n*Mean differences are per 10-year increments and are adjusted for age and sex.\n**This ratio quantifies the extent to which a given increase or decrease was greater in degree among respondents with heart failure compared to respondents without heart failure",
+#   n_rows = 2,
+#   space = 50,
+#   size = 15,
+#   xlog = F,
+#   es_label = "Mean difference (95% CI)*",
+# ) -> forest_fig_cont
+
+#Table
+mean_diff_df %>%
+  select(outcome, hf, pe_ci, pint, dd_pe_ci) %>%
+  rename(Outcome = outcome,
+         `Heart failure` = hf,
+         `Mean difference (95% CI)` = pe_ci,
+         `P-value for interaction` = pint,
+         `Excess difference in respondents with HF (95% CI)` = dd_pe_ci) %>%
+  flextable %>%
+  merge_v(j = 1) %>%
+  bold(j = 1) %>%
+  bold(part = "header") %>%
+  border_inner %>% border_outer %>%
+  set_caption("eTable 5. Temporal difference in average levels of different risk factors between respondents with and without heart failure") %>%
+  footnote(i = 1, j = c(3, 5), part = "header",
+           ref_symbols = "*",
+           value = as_paragraph("Differences are per 10-year increments and are adjusted for sex and age. Excess difference represents how much more or less pronounced a given increase or decrease was in respondents with heart failure vs respondents without heart failure.")) %>%
+  width(width = 1.5) %>%
+  save_as_docx(path = "Tables/eTable 5.docx")
+
+```
+
+## Create density figures
+
+### Function
+
+```{r}
+#Function to plot density
+plot_density <- function(outcome_var, outcome_label,
+                                 weight, 
+                                 survey_cycles1, survey_cycles2) {
+
+
+  #Filter to necessary columns
+  full_data[hf == "Yes" & !is.na(get(outcome_var)) &
+              survey_cycle %in% c(survey_cycles1, survey_cycles2),
+            .(outcome = get(outcome_var), survey_cycle, w = get(weight))
+            ] -> density_data
+  
+  #Rename survey cycles
+  #First 6 years
+  density_data[survey_cycle %in% survey_cycles1,
+               cycle := paste0(
+                 min(unlist(str_split(survey_cycles1, pattern = " to "))),
+                 " to ",
+                 max(unlist(str_split(survey_cycles1, pattern = " to ")))
+               )]
+  
+  #Last 6 years
+  density_data[survey_cycle %in% survey_cycles2,
+               cycle := paste0(
+                 min(unlist(str_split(survey_cycles2, pattern = " to "))),
+                 " to ",
+                 max(unlist(str_split(survey_cycles2, pattern = " to ")))
+               )]
+  
+  #We will retrieve the maximum y-axis value to adjust the positioning of the box plot below
+  ggplot_build(
+    ggplot(data = density_data,
+           aes(x = outcome, y = after_stat(density), weight = w, fill = cycle)) +
+      geom_density()
+  )$data[[1]]$density %>%
+    max -> max_density
+  
+  
+  #Plot
+  ggplot(data = density_data,
+       aes(x = outcome,
+           y = after_stat(density),
+           fill = cycle,
+           weight = w)
+       ) +
+  geom_density(alpha = 0.5, lwd = 1.1) +
+    geom_boxplot(inherit.aes = F,
+                 position = position_dodge(width = max_density/10),
+                 aes(x = outcome, y = -max_density/15, fill = cycle, weight = w),
+                 alpha = 0.5, lwd = 1.1, width = max_density/12.5,
+                 outlier.color = NA,
+                 show.legend = F) +
+    #Scales
+  scale_color_jama(name = "Survey cycle") +
+  scale_fill_jama(name = "Survey cycle") +
+  scale_x_continuous(name = outcome_label,
+                     trans = ifelse(outcome_var == "uacr", "log", "identity"),
+                     breaks = {if(outcome_var == "uacr") c(1, 10, 30, 100, 300, 1000, 3000) else breaks_pretty(n = 20)}
+                     ) +
+    scale_y_continuous(name = "Density",
+                       expand = c(0.01, 0)) +
+  theme_bw() +
+  theme(text = element_text(size = 23, face = "bold"),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", size = 0),
+        legend.position = c(0.8, 0.8),
+        legend.key.width = unit(4, "cm"),
+        legend.key.height = unit(0.8, "cm")
+  ) -> density_fig
+
+#Save
+ggsave(density_fig,
+       filename = paste0("Figures/overall/Density figure for ", outcome_var, ".pdf"),
+       dpi = 600,
+       width = 16, height = 9)
+
+#Return
+plot(density_fig)
+
+}
+
+```
+
+### Loop over outcomes
+
+```{r}
+
+#Create a list containing variables needed to loop the density function
+list(outcome_vars = c("sbp", "dbp",
+                      "bmi",
+                      "hba1c",
+                      "tc", "ldl", "tg",
+                      "egfr", "uacr"),
+     outcome_labels = c("Systolic blood pressure (mmHg)",
+                       "Diastolic blood pressure (mmHg)",
+                       "Body mass index (kg/m²)",
+                      "HbA1c (%)",
+                      "Total cholesterol (mg/dL)",
+                      "LDL Cholesterol (mg/dL)",
+                       "Triglycerides (mg/dL)",
+                      "eGFR (mL/min/1.73m²)",
+                      "Urine albumin-creatinine ratio (mg/g)"),
+     weights = c("exam_weight", "exam_weight",
+                "exam_weight",
+                "exam_weight",
+                "exam_weight", "fast_weight", "fast_weight",
+                "exam_weight", "exam_weight"),
+     survey_cycles1 = list(c("1988 to 1991", "1991 to 1994")) %>% rep(9),
+     survey_cycles2 = c(list(c("2017 to 2020", "2021 to 2023")) %>% rep(5),
+                        list(c("2015 to 2016", "2017 to 2020")) %>% rep(4)
+                        )
+     ) -> density_list
+
+
+
+#Loop over desired outcomes
+mapply(plot_density,
+       outcome_var = density_list$outcome_vars, 
+       outcome_label = density_list$outcome_labels,
+       weight = density_list$weights,
+       survey_cycles1 = density_list$survey_cycles1,
+       survey_cycles2 = density_list$survey_cycles2,
+       SIMPLIFY = FALSE
+       ) -> density_figs
+names(density_figs) <- density_list$outcome_vars
+
+```
+
+##Trends within disease states
+
+###Define a theme to add on top
+
+```{r}
+theme_bw() +
+  theme(text = element_text(size = 23),
+        plot.title=element_text(face = "bold",hjust = 0.0, size = 18),
+        plot.subtitle = element_text(face = "bold", size = 10, hjust = 0.0, color = "grey45"),
+        axis.text.x = element_text(size = 20, face = "bold"),
+        axis.text.y = element_text(size = 20, face = "bold"),
+        axis.title.x = element_text(size = 25, face = "bold"),
+        axis.title.y = element_text(size = 25, face = "bold"),
+        axis.line = element_line(colour = "black", linewidth = 1.2),
+        plot.margin = margin(0.5, 1, 0.5, 1, "cm"),
+        strip.text = element_text(size = 13, face = "bold"),
+        legend.position = "top") -> cont_theme
+```
+
+###BMI
+
+####Model
+
+```{r}
+svyglm(
+  design = subset(sdata, bmi < 30 & hf == "Yes"),
+  bmi ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_bmi_cont1
+svyglm(
+  design = subset(sdata, bmi >= 30 & hf == "Yes"),
+  bmi ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_bmi_cont2
+
+lapply(list(m_bmi_cont1, m_bmi_cont2),
+       svyglm_preds
+       ) -> m_bmi_preds
+m_bmi_preds[[1]][, label := "No Obesity"]
+m_bmi_preds[[2]][, label := "Obesity"] 
+m_bmi_preds <- rbindlist(m_bmi_preds)
+
+
+```
+
+####Plot
+
+```{r}
+ggplot(data = m_bmi_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "BMI (kg/m²)",
+    breaks = seq(0, 100, 1)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean BMI in patients with heart failure, according to whether BMI meets (or not) the threshold for obesity, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> bmi_cont_fig
+
+ggsave(bmi_cont_fig,
+       filename = "Figures/overall/Continuous BMI.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+
+```
+
+###HbA1c
+
+####Model
+```{r}
+svyglm(
+  design = subset(sdata, hba1c < 6.5 & hf == "Yes"),
+  hba1c ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_hba1c_cont1
+svyglm(
+  design = subset(sdata, hba1c >= 6.5 & hf == "Yes"),
+  hba1c ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_hba1c_cont2
+
+lapply(list(m_hba1c_cont1, m_hba1c_cont2),
+       svyglm_preds
+       ) -> m_hba1c_preds
+m_hba1c_preds[[1]][, label := "No diabetes"] 
+m_hba1c_preds[[2]][, label := "Diabetes"] 
+m_hba1c_preds <- rbindlist(m_hba1c_preds)
+
+```
+
+####Plot
+
+```{r}
+ggplot(data = m_hba1c_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "HbA1c (%)"
+  ) +
+  #Add title
+  ggtitle(paste0("Mean HbA1c levels in patients with heart failure, according to whether HbA1c meets (or not) the threshold for DM, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> hba1c_cont_fig
+
+ggsave(hba1c_cont_fig,
+       filename = "Figures/overall/Continuous HbA1c.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+
+```
+
+###HTN
+
+#####SBP
+
+######Model
+
+```{r}
+svyglm(
+  design = subset(sdata, (dbp < 80 & sbp < 130) & hf == "Yes"),
+  sbp ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_sbp_cont1
+svyglm(
+  design = subset(sdata, (dbp >= 80 | sbp >= 130) & hf == "Yes"),
+  sbp ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_sbp_cont2
+
+lapply(list(m_sbp_cont1, m_sbp_cont2),
+       svyglm_preds
+       ) -> m_sbp_preds
+m_sbp_preds[[1]][, label := "No hypertension"]
+m_sbp_preds[[2]][, label := "Hypertension"] 
+m_sbp_preds <- rbindlist(m_sbp_preds)
+
+```
+
+######Plot
+
+```{r}
+ggplot(data = m_sbp_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Systolic blood pressure (mmHg)",
+    breaks = seq(0, 300, 2)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean systolic blood pressure levels in patients with heart failure, in patients with or without hypertension, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> sbp_cont_fig
+
+ggsave(sbp_cont_fig,
+       filename = "Figures/overall/Continuous SBP.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+
+```
+
+#### DBP
+
+###### Model
+
+```{r}
+svyglm(
+  design = subset(sdata, (dbp < 80 & dbp < 130) & hf == "Yes"),
+  dbp ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_dbp_cont1
+svyglm(
+  design = subset(sdata, (dbp >= 80 | dbp >= 130) & hf == "Yes"),
+  dbp ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_dbp_cont2
+
+lapply(list(m_dbp_cont1, m_dbp_cont2),
+       svyglm_preds
+) -> m_dbp_preds
+m_dbp_preds[[1]][, label := "No hypertension"]
+m_dbp_preds[[2]][, label := "Hypertension"] 
+m_dbp_preds <- rbindlist(m_dbp_preds)
+
+```
+
+###### Plot
+
+```{r}
+ggplot(data = m_dbp_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Diastolic blood pressure (mmHg)",
+    breaks = seq(0, 300, 2)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean diastolic blood pressure levels in patients with heart failure, in patients with or without hypertension, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> dbp_cont_fig
+
+ggsave(dbp_cont_fig,
+       filename = "Figures/overall/Continuous DBP.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+```
+
+
+###Hypercholesterol
+
+####Model
+
+```{r}
+svyglm(
+  design = subset(sdata, tc < 200 & hf == "Yes"),
+  tc ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_tc_cont1
+svyglm(
+  design = subset(sdata, tc >= 200 & hf == "Yes"),
+  tc ~ rcs(year, parms = c(1990.25, 2004.00, 2012.00, 2022.70))) -> m_tc_cont2
+
+lapply(list(m_tc_cont1, m_tc_cont2),
+       svyglm_preds
+) -> m_tc_preds
+m_tc_preds[[1]][, label := "No Hypercholesterolemia"] 
+m_tc_preds[[2]][, label := "Hypercholesterolemia"] 
+m_tc_preds <- rbindlist(m_tc_preds)
+
+```
+####Plot
+```{r}
+
+ggplot(data = m_tc_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "Total cholesterol (mg/dL)",
+    breaks = seq(0, 300, 10)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean total cholesterol levels in patients with heart failure, in patients with or without hypercholesterolemia, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> tc_cont_fig
+
+ggsave(tc_cont_fig,
+       filename = "Figures/overall/Continuous TC.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+```
+
+###LDL
+
+####Model
+
+```{r}
+svyglm(
+  design = subset(sdata_fast, ldl < 160 & hf == "Yes"),
+  ldl ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_ldl_cont1
+svyglm(
+  design = subset(sdata_fast, ldl >= 160 & hf == "Yes"),
+  ldl ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_ldl_cont2
+
+lapply(list(m_ldl_cont1, m_ldl_cont2),
+       svyglm_preds, newdata = data.frame(year = seq(1988, 2020, 1))
+) -> m_ldl_preds
+m_ldl_preds[[1]][, label := "LDL-C less than 160mg/dL"] 
+m_ldl_preds[[2]][, label := "LDL-C 160mg/dL or greater"] 
+m_ldl_preds <- rbindlist(m_ldl_preds)
+
+```
+
+####Plot
+
+```{r}
+ggplot(data = m_ldl_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+       ) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "LDL-C (mg/dL)",
+    breaks = seq(0, 300, 10)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean LDL-C levels in patients with heart failure, in patients with or without LDL-C greater than 160mg/dL, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> ldl_cont_fig
+
+ggsave(ldl_cont_fig,
+       filename = "Figures/overall/Continuous LDL-C.pdf",
+       dpi = 600, width = 16, height = 9
+       )
+
+```
+
+###CKD
+
+####eGFR
+
+#####Model
+
+```{r}
+svyglm(
+  design = subset(sdata, egfr < 60 & hf == "Yes"),
+  egfr ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_egfr_cont1
+svyglm(
+  design = subset(sdata, egfr >= 60 & hf == "Yes"),
+  egfr ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_egfr_cont2
+
+lapply(list(m_egfr_cont1, m_egfr_cont2),
+       svyglm_preds, newdata = data.frame(year = seq(1988, 2020, 1))
+) -> m_egfr_preds
+m_egfr_preds[[1]][, label := "eGFR less than 60mL/min/1.73m²)"] 
+m_egfr_preds[[2]][, label := "eGFR 60mL/min/1.73m² or greater)"] 
+m_egfr_preds <- rbindlist(m_egfr_preds)
+
+```
+
+#####Plot
+
+```{r}
+ggplot(data = m_egfr_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "eGFR (mL/min/1.73m²)",
+    breaks = seq(0, 1000, 2)
+  ) +
+  #Add title
+  ggtitle(paste0("Mean eGFR levels in patients with heart failure, in patients with or without eGFR <60mL/min/1.73m², 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> egfr_cont_fig
+
+ggsave(egfr_cont_fig,
+       filename = "Figures/overall/Continuous eGFR.pdf",
+       dpi = 600, width = 16, height = 9
+)
+
+```
+
+####UACR
+
+#####Model
+
+```{r}
+svyglm(
+  design = subset(sdata, uacr < 30 & hf == "Yes"),
+  uacr ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_uacr_cont1
+svyglm(
+  design = subset(sdata, uacr >= 30 & hf == "Yes"),
+  uacr ~ rcs(year, parms = c(1990.25, 2008.00, 2018.60))) -> m_uacr_cont2
+
+lapply(list(m_uacr_cont1, m_uacr_cont2),
+       svyglm_preds, newdata = data.frame(year = seq(1988, 2020, 1))
+) -> m_uacr_preds
+m_uacr_preds[[1]][, label := "No Albuminuria"] 
+m_uacr_preds[[2]][, label := "Albuminuria"] 
+m_uacr_preds <- rbindlist(m_uacr_preds)
+```
+
+#####Plot
+
+```{r}
+ggplot(data = m_uacr_preds,
+       aes(
+         x = year,
+         y = pe,
+         ymax = uci,
+         ymin = lci,
+         color = label,
+         fill = label
+       )
+) +
+  #Points and lines and ribbons
+  geom_point(size = 4) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(alpha = 0.2) +
+  facet_grid(rows = vars(label), scales = "free_y") +
+  #Colors
+  scale_fill_jama(name = NULL) +
+  scale_color_jama(name = NULL) +
+  #Axes
+  scale_x_continuous(
+    name = "Year",
+    breaks = seq(0, 5000, 2),
+    expand = c(0.02, 0.0)
+  ) +
+  scale_y_continuous(
+    name = "eGFR (mL/min/1.73m²)"
+  ) +
+  #Add title
+  ggtitle(paste0("Mean UACR levels in patients with heart failure, in patients with or without microalbuminuria, 1988-2023"),
+          subtitle = "Line represents means across time and ribbons represent the 95% CI.") +
+  #Theme
+  cont_theme -> uacr_cont_fig
+
+ggsave(uacr_cont_fig,
+       filename = "Figures/overall/Continuous UACR.pdf",
+       dpi = 600, width = 16, height = 9
+)
+```
+
+## Table 1 (Results summary)
+
+### Create data
+
+```{r}
+data.table(
+  `Risk factor` = c(
+    "Elevated blood pressure",
+    "     Stage 1 hypertension",
+    "     Stage 2 hypertension",
+    "Obesity",
+    "     Class I/II obesity",
+    "     Class III obesity",
+    "Impaired glucose homeostasis",
+    "     Prediabetes",
+    "     Diabetes",
+    "Hypercholesterolemia",
+    "     Elevated LDL-C",
+    "     Hypertriglyceridemia",
+    "Myocardial Infarction",
+    "Chronic Kidney Disease",
+    "     Reduced eGFR",
+    "     Albuminuria"
+  ),
+  `Estimated % prevalence in 1988 (95% CI)` = c(
+    htn_trends$overall$htn$preds_df[year == 1988, pe_ci],
+    htn_trends$overall$htn1$preds_df[year == 1988, pe_ci],
+    htn_trends$overall$htn2$preds_df[year == 1988, pe_ci],
+    obesity_trends$overall$obesity$preds_df[year == 1988, pe_ci],
+    obesity_trends$overall$obesity12$preds_df[year == 1988, pe_ci],
+    obesity_trends$overall$obesity3$preds_df[year == 1988, pe_ci],
+    dm_trends$overall$pre_dm_or_dm$preds_df[year == 1988, pe_ci],
+    dm_trends$overall$pre_dm$preds_df[year == 1988, pe_ci],
+    dm_trends$overall$dm$preds_df[year == 1988, pe_ci],
+    hypercholesterol_trends$overall$preds_df[year == 1988, pe_ci],
+    hyperldl_trends$overall$preds_df[year == 1988, pe_ci],
+    hypertg_trends$overall$preds_df[year == 1988, pe_ci],
+    mi_trends$overall$preds_df[year == 1988, pe_ci],
+    ckd345_albumin_trends$overall$preds_df[year == 1988, pe_ci],
+    ckd345_trends$overall$preds_df[year == 1988, pe_ci],
+    albuminuria_trends$overall$preds_df[year == 1988, pe_ci]
+  ),
+  `Estimated % prevalence in 2023 or 2020 (95% CI)` = c(
+    htn_trends$overall$htn$preds_df[year == 2023, pe_ci],
+    htn_trends$overall$htn1$preds_df[year == 2023, pe_ci],
+    htn_trends$overall$htn2$preds_df[year == 2023, pe_ci],
+    obesity_trends$overall$obesity$preds_df[year == 2023, pe_ci],
+    obesity_trends$overall$obesity12$preds_df[year == 2023, pe_ci],
+    obesity_trends$overall$obesity3$preds_df[year == 2023, pe_ci],
+    dm_trends$overall$pre_dm_or_dm$preds_df[year == 2023, pe_ci],
+    dm_trends$overall$pre_dm$preds_df[year == 2023, pe_ci],
+    dm_trends$overall$dm$preds_df[year == 2023, pe_ci],
+    hypercholesterol_trends$overall$preds_df[year == 2023, pe_ci],
+    hyperldl_trends$overall$preds_df[year == 2020, pe_ci],
+    hypertg_trends$overall$preds_df[year == 2020, pe_ci],
+    mi_trends$overall$preds_df[year == 2023, pe_ci],
+    ckd345_albumin_trends$overall$preds_df[year == 2020, pe_ci],
+    ckd345_trends$overall$preds_df[year == 2020, pe_ci],
+    albuminuria_trends$overall$preds_df[year == 2020, pe_ci]
+  ),
+  `Prevalence ratio (95% CI)` = c(
+    htn_trends$overall$htn$contrasts_df[, pe_ci],
+    htn_trends$overall$htn1$contrasts_df[, pe_ci],
+    htn_trends$overall$htn2$contrasts_df[, pe_ci],
+    obesity_trends$overall$obesity$contrasts_df[, pe_ci],
+    obesity_trends$overall$obesity12$contrasts_df[, pe_ci],
+    obesity_trends$overall$obesity3$contrasts_df[, pe_ci],
+    dm_trends$overall$pre_dm_or_dm$contrasts_df[, pe_ci],
+    dm_trends$overall$pre_dm$contrasts_df[, pe_ci],
+    dm_trends$overall$dm$contrasts_df[, pe_ci],
+    hypercholesterol_trends$overall$contrasts_df[, pe_ci],
+    hyperldl_trends$overall$contrasts_df[, pe_ci],
+    hypertg_trends$overall$contrasts_df[, pe_ci],
+    mi_trends$overall$contrasts_df[, pe_ci],
+    ckd345_albumin_trends$overall$contrasts_df[, pe_ci],
+    ckd345_trends$overall$contrasts_df[, pe_ci],
+    albuminuria_trends$overall$contrasts_df[, pe_ci]
+  ),
+  `Prevalence ratio (95% CI) for women` = c(
+    htn_trends$sex$htn$contrasts_df[int_factor == "Women", pe_ci],
+    htn_trends$sex$htn1$contrasts_df[int_factor == "Women", pe_ci],
+    htn_trends$sex$htn2$contrasts_df[int_factor == "Women", pe_ci],
+    obesity_trends$sex$obesity$contrasts_df[int_factor == "Women", pe_ci],
+    obesity_trends$sex$obesity12$contrasts_df[int_factor == "Women", pe_ci],
+    obesity_trends$sex$obesity3$contrasts_df[int_factor == "Women", pe_ci],
+    dm_trends$sex$pre_dm_or_dm$contrasts_df[int_factor == "Women", pe_ci],
+    dm_trends$sex$pre_dm$contrasts_df[int_factor == "Women", pe_ci],
+    dm_trends$sex$dm$contrasts_df[int_factor == "Women", pe_ci],
+    hypercholesterol_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    hyperldl_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    hypertg_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    mi_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    ckd345_albumin_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    ckd345_trends$sex$contrasts_df[int_factor == "Women", pe_ci],
+    albuminuria_trends$sex$contrasts_df[int_factor == "Women", pe_ci]
+  ),
+  `Prevalence ratio (95% CI) for men` = c(
+    htn_trends$sex$htn$contrasts_df[int_factor == "Men", pe_ci],
+    htn_trends$sex$htn1$contrasts_df[int_factor == "Men", pe_ci],
+    htn_trends$sex$htn2$contrasts_df[int_factor == "Men", pe_ci],
+    obesity_trends$sex$obesity$contrasts_df[int_factor == "Men", pe_ci],
+    obesity_trends$sex$obesity12$contrasts_df[int_factor == "Men", pe_ci],
+    obesity_trends$sex$obesity3$contrasts_df[int_factor == "Men", pe_ci],
+    dm_trends$sex$pre_dm_or_dm$contrasts_df[int_factor == "Men", pe_ci],
+    dm_trends$sex$pre_dm$contrasts_df[int_factor == "Men", pe_ci],
+    dm_trends$sex$dm$contrasts_df[int_factor == "Men", pe_ci],
+    hypercholesterol_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    hyperldl_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    hypertg_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    mi_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    ckd345_albumin_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    ckd345_trends$sex$contrasts_df[int_factor == "Men", pe_ci],
+    albuminuria_trends$sex$contrasts_df[int_factor == "Men", pe_ci]
+  ),
+  `P-value for interaction by sex` = c(
+    htn_trends$sex$p_interaction %>% p,
+    "",
+    "",
+    obesity_trends$sex$p_interaction %>% p,
+    "",
+    "",
+    dm_trends$sex$p_interaction %>% p,
+    "",
+    "",
+    hypercholesterol_trends$sex$rrr_df$pval_int %>% p,
+    "",
+    "",
+    mi_trends$sex$rrr_df$pval_int %>% p,
+    ckd345_albumin_trends$sex$rrr_df$pval_int %>% p,
+    "",
+    ""
+  ),
+  `Prevalence ratio (95% CI) for Hispanic, Black, or other minority persons` = c(
+    htn_trends$race_binary$htn$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    htn_trends$race_binary$htn1$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    htn_trends$race_binary$htn2$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    obesity_trends$race_binary$obesity$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    obesity_trends$race_binary$obesity12$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    obesity_trends$race_binary$obesity3$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    dm_trends$race_binary$pre_dm_or_dm$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    dm_trends$race_binary$pre_dm$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    dm_trends$race_binary$dm$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    hypercholesterol_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    hyperldl_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    hypertg_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    mi_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    ckd345_albumin_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    ckd345_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci],
+    albuminuria_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci]
+  ),
+  `Prevalence ratio (95% CI) for NH White persons` = c(
+    htn_trends$race_binary$htn$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    htn_trends$race_binary$htn1$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    htn_trends$race_binary$htn2$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    obesity_trends$race_binary$obesity$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    obesity_trends$race_binary$obesity12$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    obesity_trends$race_binary$obesity3$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    dm_trends$race_binary$pre_dm_or_dm$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    dm_trends$race_binary$pre_dm$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    dm_trends$race_binary$dm$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    hypercholesterol_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    hyperldl_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    hypertg_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    mi_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    ckd345_albumin_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    ckd345_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci],
+    albuminuria_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci]
+  ),
+  `P-value for interaction by race/ethnicity` = c(
+    htn_trends$race_binary$p_interaction %>% p,
+    "",
+    "",
+    obesity_trends$race_binary$p_interaction %>% p,
+    "",
+    "",
+    dm_trends$race_binary$p_interaction %>% p,
+    "",
+    "",
+    hypercholesterol_trends$race_binary$rrr_df$pval_int %>% p,
+    "",
+    "",
+    mi_trends$race_binary$rrr_df$pval_int %>% p,
+    ckd345_albumin_trends$race_binary$rrr_df$pval_int %>% p,
+    "",
+    ""
+  )
+  
+) -> results_summary_table
+
+
+```
+
+
+### Tabulate
+
+```{r}
+results_summary_table %>%
+  flextable %>%
+  merge_h %>%
+  bold(i = 1, part = "header") %>%
+  bold(j = 1) %>%
+  set_caption(caption = as_paragraph("Table 1. Summary of changes in the prevalence of risk factors among patients with heart failure in the US, 1988-2023.")) %>%
+  flextable::width(width = 2) %>%
+    footnote(i = 1, j = 3, part = "header",
+           ref_symbols = "\U002A",
+           value = as_paragraph("Data on low-density lipoprotein cholesterol (LDL-C), triglycerides, estimated glomerular filtration rate, and urine albumin-creatinine were only collected up to 2020 by NHANES.")) %>%
+  footnote(i = 1, j = c(7, 10), part = "header",
+           ref_symbols = "\U2020",
+           value = as_paragraph("For this analysis, a P-value of 0.05 denoted statistical significance for all results, including interactions. Some practitioners use a more liberal threshold of 0.1 owing to the lesser statistical power of subgroup analyses.")) %>%
+  footnote(i = 1, j = c(7, 10), part = "header",
+           ref_symbols = "\U2021",
+           value = as_paragraph("Because smooth interactions between time and race/sex were used, interaction P-values do not correspond to tests of differences in the reported prevalence ratios between subgroups but instead test for differences in in the shape of the trend across the entire study period.")) %>%
+    footnote(i = 1, j = c(7, 10), part = "header",
+           ref_symbols = "\U00A7",
+           value = as_paragraph("To minimize the risk of false positive interactions with subgroup testing, interaction P-values for only the 6 main risk factor domains of interest (elevated blood pressure, impaired glucose homeostasis, obesity, hypercholesterolemia, myocardial infarction, and chronic kidney disease) are reported.")) %>%
+  flextable::font(fontname = "Times New Roman") %>%
+  border_inner %>%
+  border_outer %>%
+  save_as_docx(path = "Tables/Table 1.docx")
+c("\U002A", "\U2020", "\U2021", "\U00A7")
+```
+
+
+## eTable 1 (N of respondents)
+
+```{r}
+data.table(
+  `Survey Cycle` = full_data[, unique(survey_cycle)],
+  `N with heart failure` = full_data[!is.na(hf), sum(hf == "Yes"), by = .(survey_cycle)][,V1],
+  `N without heart failure` = full_data[!is.na(hf), sum(hf == "No"), by = .(survey_cycle)][,V1]
+) -> etable1
+
+flextable(etable1) %>%
+  border_inner %>%
+  border_outer %>%
+  merge_h %>%
+  bold(i = 1, part = "header") %>%
+  bold(j = 1) %>%
+  set_caption(caption = as_paragraph(paste0("eTable 1. Number of respondents, stratified by the presence or absence of heart failure, in each NHANES survey cycle."))) %>%
+  flextable::font(fontname = "Times New Roman") %>%
+  width(width = 2.5) %>%
+  save_as_docx(path = "Tables/eTable 1.docx")
+
+
+
+```
+
+
+## eTable 2/3 (Baseline CCs)
+
+###CCs function
+
+```{r}
+
+#Create a function to get a weighted median/IQR for continuous variables
+wtd_median_iqr <- function(var, wt, rounding = 0) {
+  paste0(round(wtd.quantile(var, weights = wt, na.rm = T)[3], rounding) %>% format(nsmall = rounding),
+         " (", round(wtd.quantile(var, weights = wt, na.rm = T)[2], rounding) %>% format(nsmall = rounding),
+         " to ",
+         round(wtd.quantile(var, weights = wt, na.rm = T)[4], rounding) %>% format(nsmall = rounding),
+         ")")
+}
+
+#Function to tabulate characteristics by survey cycle
+table_survey_cycle_fn <- function(hf_subset, table_title, table_width, font_size) {
+list(c("Age (years)", full_data[hf == hf_subset, wtd_median_iqr(age, int_weight), by = survey_cycle][, V1]),
+     c("Proportion of women (%)", full_data[hf == hf_subset, sum(int_weight[sex == "Women"]/sum(int_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("Proportion of Non-Hispanic Black, Hispanic, or Other Minority (%)", full_data[hf == hf_subset, sum(int_weight[race_binary == "Non-Hispanic Black, Hispanic, or Other Minority"]/sum(int_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("Body mass index (kg/m²)", full_data[hf == hf_subset & !is.na(bmi), wtd_median_iqr(bmi, exam_weight, 1), by = survey_cycle][, V1]),
+     c("Systolic Blood pressure (mmHg)", full_data[hf == hf_subset & !is.na(sbp), wtd_median_iqr(sbp, exam_weight, 0), by = survey_cycle][, V1]),
+     c("Diastolic Blood pressure (mmHg)", full_data[hf == hf_subset & !is.na(dbp), wtd_median_iqr(dbp, exam_weight, 0), by = survey_cycle][, V1]),
+     c("HbA1c (%)", full_data[hf == hf_subset & !is.na(hba1c), wtd_median_iqr(hba1c, exam_weight, 1), by = survey_cycle][, V1]),
+     c("Low-density lipoprotein cholesterol (mg/dL)", full_data[hf == hf_subset & !is.na(ldl), wtd_median_iqr(ldl, fast_weight, 0), by = survey_cycle][, V1]),
+     c("Triglycerides (mg/dL)", full_data[hf == hf_subset & !is.na(ldl), wtd_median_iqr(tg, fast_weight, 0), by = survey_cycle][, V1]),
+     c("Estimated glomerular filtration rate (mL/min/1.73m²)", full_data[hf == hf_subset & !is.na(egfr), wtd_median_iqr(egfr, exam_weight, 0), by = survey_cycle][, V1]),
+     c("Urine albumin-creatinine ratio (mg/g)", full_data[hf == hf_subset & !is.na(uacr), wtd_median_iqr(uacr, exam_weight, 0), by = survey_cycle][, V1]),
+     c("Cardiovascular risk factors (%)", rep("", times = full_data[, uniqueN(survey_cycle)])),
+     c("   Obesity", full_data[hf == hf_subset & !is.na(bmi), sum(exam_weight[bmi >= 30]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Class I/II Obesity", full_data[hf == hf_subset & !is.na(bmi), sum(exam_weight[bmi %between% c(30, 39.999)]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Class III Obesity", full_data[hf == hf_subset & !is.na(bmi), sum(exam_weight[bmi >= 40]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Prediabetes", full_data[hf == hf_subset & !is.na(hba1c), sum(exam_weight[hba1c >= 5.7 & hba1c < 6.5]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Prediabetes or diabetes", full_data[hf == hf_subset & !is.na(hba1c), sum(exam_weight[hba1c >= 5.7]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Prediabetes", full_data[hf == hf_subset & !is.na(hba1c), sum(exam_weight[hba1c %between% c(5.7, 6.4999)]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Diabetes", full_data[hf == hf_subset & !is.na(hba1c), sum(exam_weight[hba1c >= 6.5]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+      c("   Elevated Blood Pressure", full_data[hf == hf_subset & !is.na(sbp) & !is.na(dbp), sum(exam_weight[sbp >= 130 | dbp >= 80]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Stage 1 hypertension", full_data[hf == hf_subset & !is.na(sbp) & !is.na(dbp), sum(exam_weight[sbp %between% c(130, 139.999) | dbp %between% c(80, 89.9999)]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Stage 2 hypertension", full_data[hf == hf_subset & !is.na(sbp) & !is.na(dbp), sum(exam_weight[sbp >= 140 | dbp >= 90]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Hypercholesterolemia", full_data[hf == hf_subset & !is.na(tc) & !is.na(tg), sum(exam_weight[tc >= 200]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Hypertriglyceridemia", full_data[hf == hf_subset & !is.na(tg), sum(fast_weight[tg >= 200]/sum(fast_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   Elevated LDL-C", full_data[hf == hf_subset & !is.na(ldl), sum(fast_weight[ldl >= 200]/sum(fast_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   History of myocardial infarction (%)", full_data[hf == hf_subset & !is.na(mi), sum(int_weight[mi == "Yes"]/sum(int_weight)), by = survey_cycle][, r1(100*V1)]),
+     c("   History of chronic kidney disease (%)", full_data[hf == hf_subset & !is.na(ckd345_albumin), sum(exam_weight[ckd345_albumin == "Yes"]/sum(exam_weight)), by = survey_cycle][, r1(100*V1)])
+     ) -> table_list
+
+#Add an N/A for variables which were not collected in the last survey cycle
+lapply(table_list, function(x) if(length(x) < full_data[, uniqueN(survey_cycle) + 1]) c(x, "N/A") else x) -> table_list
+
+#Unlist
+unlist(table_list) -> table_vector
+#Morph into a table
+matrix(table_vector,
+       ncol = full_data[, uniqueN(survey_cycle) + 1],
+       byrow = T) %>%
+  data.table -> table_dt
+
+#Rename
+names(table_dt) <- c("Variable", full_data[, unique(survey_cycle) %>% as.character])
+
+#Flextable
+flextable(table_dt) %>%
+  border_inner %>%
+  border_outer %>%
+  merge_h %>%
+  bold(i = 1, part = "header") %>%
+  bold(j = 1) %>%
+  set_caption(caption = as_paragraph(table_title)) %>%
+  flextable::font(fontname = "Times New Roman") %>%
+  fontsize(size = font_size) %>%
+  width(., width = table_width) -> table_flex
+
+#Return
+table_flex
+}
+
+```
+
+###Tabulate
+
+```{r}
+#Tabulate baseline CCs by survey cycle for respondents with HF
+table_survey_cycle_fn(hf_subset = "Yes",
+                      table_title = "eTable 2. Characteristics of respondents with heart failure in each NHANES survey cycle.",
+                      table_width = 1.5,
+                      font_size = 10) %>%
+  save_as_docx(path = "Tables/eTable 2.docx")
+#Then, those without HF
+table_survey_cycle_fn(hf_subset = "No",
+                      table_title = "eTable 3. Characteristics of respondents without heart failure in each NHANES survey cycle.",
+                      table_width = 1.5,
+                      font_size = 10) %>%
+  save_as_docx(path = "Tables/eTable 3.docx")
+
+
+```
+
+## eTable 4 (HF Prevalence as a function of different variables)
+
+### Functions to create plots
+
+```{r}
+library(gt)
+
+t1_cont_ggplot <- function(pred_var, survey_weight) {
+  #Declare formula
+  reg_formula <- as.formula(paste0("hf", " ~ s(", pred_var, ", k = 4)"))
+  
+  #Run model
+  gam(data = full_data,
+      method = "REML",
+      weight = full_data[, get(survey_weight)],
+      family = "binomial",
+      formula = reg_formula) -> reg_model
+  
+  #Predict
+  pred_var_vector <- full_data[, get(pred_var) %>% unique %>% sort]
+  predict(reg_model, 
+          newdata = tibble(!!as.symbol(pred_var) := pred_var_vector)
+  ) -> reg_preds
+  reg_preds <- plogis(reg_preds)
+  
+  #Combine in a data.frame
+  data.table(
+    predictor = pred_var_vector,
+    hf_prev = reg_preds
+  ) -> gg_df
+  
+  #Trim to 5th and 95th percentiles
+  trim_limits <- full_data[, quantile(get(pred_var), c(0.025, 0.975), na.rm = T)]
+  gg_df <- gg_df[predictor %between% trim_limits]
+  
+  #Use log scale on X-axis for UACR
+  trans_choice <- fifelse(pred_var == "uacr", "log", "identity")
+  
+  #Plot
+  ggplot(data = gg_df,
+         aes(y = hf_prev,
+             x = predictor)
+  ) +
+    geom_line(lwd = 2.5) +
+    scale_x_continuous(name = NULL,
+                       breaks = {if(pred_var == "uacr") c(10, 100, 1000, 10000) else breaks_pretty(n = 5)},
+                       trans = trans_choice) +
+    scale_y_continuous(name = NULL,
+                       labels = function(x) x * 100) +
+    theme_bw() +
+    theme(panel.border = element_blank(),
+          axis.line = element_line(),
+          axis.text = element_text(size = 30, face = "bold")
+    )
+}
+
+#For categorical variables
+t1_cat_ggplot <- function(pred_var, survey_weight) {
+  
+  #Get proportions
+  full_data[, .(n = sum(get(survey_weight))), 
+            by = .(`predictor` = get(pred_var))][, .(predictor,
+                                                     prop = n/sum(n))] -> gg_df
+  
+  #Plot
+  ggplot(data = gg_df,
+         aes(y = prop,
+             x = predictor,
+             fill = predictor)
+  ) +
+    geom_col(lwd = 2.5) +
+    scale_x_discrete(name = NULL, labels = NULL) +
+    scale_y_continuous(name = NULL,
+                       labels = function(x) x * 100) +
+    scale_fill_jama(name = NULL) +
+    theme_bw() +
+    theme(panel.border = element_blank(),
+          axis.line = element_line(),
+          axis.text = element_text(size = 30, face = "bold"),
+          legend.position = "top",
+          legend.text = element_text(size = 40, face = "bold"),
+          legend.key.width = unit(3, "cm")
+    ) +
+    guides(fill = guide_legend(nrow = 2, byrow = T))
+  
+}
+
+
+#Function to create a mini ggplot2
+t1_ggplot <- function(pred_var, survey_weight) {
+  
+  
+  if(full_data[, is.numeric(get(pred_var))]) {
+    t1_cont_ggplot(pred_var = pred_var, survey_weight = survey_weight)
+  } else {
+    t1_cat_ggplot(pred_var = pred_var, survey_weight = survey_weight)
+  }
+  
+
+}
+
+```
+
+### Tabulate
+
+```{r}
+#Continuous variables in table 1
+pred_vars <- c("age", 
+               "sex",
+               "race_binary",
+                   "bmi", 
+                   "sbp", "dbp",
+                   "hba1c", "tc",
+                   "ldl", "tg",
+                   "egfr", "uacr")
+
+#Their respective weights
+survey_weights <- c("int_weight", 
+                    "int_weight",
+                    "int_weight",
+                         "exam_weight",
+                         "exam_weight", "exam_weight",
+                         "exam_weight", "exam_weight", 
+                         "fast_weight", "fast_weight",
+                         "exam_weight", "exam_weight")
+
+#loop over them to produce plots
+mapply(t1_ggplot,
+       pred_var = pred_vars,
+       survey_weight = survey_weights,
+       SIMPLIFY = F
+       ) -> t1_plots
+names(t1_plots) <- pred_vars
+       
+    
+tibble(Variables = c("Age (years)", "Sex", "Race/ethnicity",
+                     "Body mass index (kg/m²)",
+                "Systolic blood pressure (mmHg)", "Diastolic blood pressure (mmHg)",
+                "HbA1c (%)", "Total cholesterol (mg/dL)",
+                "Low-density lipoprotein cholesterol (mg/dL)", "Triglycerides (mg/dL)",
+                "Estimated glomerular filtration rate (mL/min/1.73m²)", "Urine albumin/creatinine ratio (mg/dL)"
+                ),
+       `Prevalence of heart failure (%)` = NA) -> new_t1
+
+library(gt)
+#Convert to gt and add plots
+new_t1 %>%
+  gt %>%
+  text_transform(
+    locations = cells_body(columns = `Prevalence of heart failure (%)`),
+    fn = function(x) {
+      t1_plots %>%
+        ggplot_image(height = px(100),
+                     aspect_ratio = 4)
+    }
+  ) -> new_t1
+
+
+#Add title and bold
+new_t1 %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = list(cells_column_labels(everything()),
+                     cells_body(),
+                     cells_title()
+    )
+  ) -> new_t1
+
+#Save
+gtsave(new_t1, filename = "Tables/eTable 4.png")
+
+```
+
+# Save
+
+```{r}
+save(
+  #Datasets
+  full_data,
+  sdata,
+  #Trends
+  hf_trends, aa_preds_df, year_rexvar, age_rexvar,
+  htn_trends, htn_hist2_trends, bb_trends, acei_arb_trends, thiazide_trends, ccb_trends,
+  obesity_trends, 
+  dm_trends,
+  hypercholesterol_trends, dyslipid_hist2_trends, hyperldl_trends, hypertg_trends, statin_trends,
+  mi_trends,
+  ckd345_trends, ckd345_albumin_trends, albuminuria_trends,
+  #Multipanel figures
+  hf_panels_fig, htn_panels_fig, obesity_panels_fig, dm_panels_fig,
+  #HF Prevalence figure
+  trends_hf_fig, trends_sex_hf_fig, trends_race_hf_fig, trends_hf_n_fig, hf_age_strat_fig, trends_hf_aa_fig,
+   #RF Figures
+  trends_fig_rfs,
+  cum_figs,
+  #Med figures
+  trends_fig_meds,
+  #Forest figure (binary)
+  forest_fig_binary,
+  #Density figures
+  density_figs,
+  #Trends within outcome categories
+  bmi_cont_fig, hba1c_cont_fig, sbp_cont_fig, dbp_cont_fig,
+  tc_cont_fig, ldl_cont_fig, egfr_cont_fig, uacr_cont_fig,
+   #File
+   file = "Rendering Data.RData")
+
+```

@@ -1,0 +1,568 @@
+---
+title: "The Evolving Epidemiology of Heart Failure and its Underlying Risk Factors in the United States"
+subtitle: "An analysis of NHANES data, 1988 to 2023"
+format: 
+  html:
+    toc: true
+    toc-expand: true
+    toc-location: body
+date: 03-15-2025
+theme: lightly
+author:
+  - name: "Ahmed Sayed (asu.ahmed.sayed@gmail.com)"
+    affiliations: "Houston Methodist DeBakey Heart & Vascular Center"
+embed-resources: true
+toc-title: Contents
+page-layout: full
+code-fold: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+#Load rendering data
+load("Rendering Data.RData")
+#Self-made
+#Round to 1 decimal and include zero if needed
+r1 <- function(x) {
+  x %>% round(1) %>% format(nsmall = 1)
+}
+
+#Function to format P-values
+p <- function(p) {
+  ifelse(p < 0.001, "<0.001", ifelse(round(p, 2) == 0.05 | round(p, 2) == 0, round(p, 3) %>% format(nsmall = 3), round(p, 2) %>% format(nsmall = 2))) %>% as.character
+}
+
+#Packages
+library(dplyr)
+library(stringr)
+library(data.table)
+library(ggplot2)
+library(ggh4x)
+library(scales)
+library(survey)
+library(scales)
+
+
+#Create a function to neatly get survey totals/proportions and confidence intervals
+svytotal_df <- function(design, variables) {
+  
+  #Get chosen variables in the form of "or"
+  variables[2] %>%
+    #Convert to character
+    paste0 %>%
+    #Replace + with or
+    str_replace_all("\\+", "\\|") %>%
+    #Squish together
+    str_replace_all(" \\| ", "\\|") -> chosen_vars
+  
+  svytotal(design = design, variables, na.rm = T) -> svytotal_object
+  #Get the part of svytotal's name that corresponds to the variable name
+  svytotal_object %>%
+    names %>%
+    str_extract(chosen_vars) -> chosen_vars
+  
+  #Get the part of svytotal's name that corresponds to the variable value
+  svytotal_object %>%
+    names %>%
+    str_remove_all(chosen_vars) -> chosen_vars_levels
+  
+  #Produce data.table containing the information on totals
+  data.table(
+    #Variable
+    var = chosen_vars,
+    #Variable level
+    value = chosen_vars_levels,
+    #Total
+    pe = svytotal_object %>%
+      data.frame %>%
+      {.$total},
+    #LCI
+    lci = svytotal_object %>% confint %>% data.frame %>% {.$X2.5..},
+    #UCI
+    uci = svytotal_object %>% confint %>% data.frame %>% {.$X97.5..}
+  ) -> total_df
+  
+  lapply(chosen_vars_levels,
+         function(level) {
+           form <- bquote(~ .(variables[[2]]) == .(level))
+           #Get proportion
+           svyciprop(design = design, 
+          formula = form, na.rm = T
+          ) %>% {data.table(
+               prop_pe = .[1],
+               prop_lci = attr(., "ci") %>% .["2.5%"],
+               prop_uci = attr(., "ci") %>% .["97.5%"]
+             )}
+         }
+  ) %>%
+    rbindlist -> props_df
+  
+  #Bind
+  df <- cbind(total_df, props_df)
+  
+  #Return
+  df
+  
+}
+
+#Function to retrieve CIs specfically
+ci <- function(pe_ci) {
+  str_remove(word(pe_ci, 2, sep = "\\("), "\\)") %>%
+    str_replace(" to ", "%, ") %>%
+    str_squish
+}
+
+  #Function to calculate % change
+pc <- function(pe) {
+  output <- if(pe > 1) {
+    pe - 1
+  } else if(pe < 1) {
+    1 - pe
+  }
+  
+  percent(output, 1)
+}
+
+#Get prevalence ratio
+pr <- function(pe_ci) {
+  pe_ci %>%
+    str_replace(" \\(", "; 95%CI: ") %>%
+    str_remove("\\)") %>%
+    paste0("PR: ", .) %>%
+    str_replace(" to ", ", ") %>%
+    str_squish
+}
+
+```
+
+**Results**
+
+**Baseline characteristics**
+
+Across 13 survey cycles from 1988 to 2023, a total of `r sdata$variables[, .N] %>% comma` participants aged 20 years or older were included in this analysis. Of these, `r sdata$variables[hf == "Yes", .N] %>% comma` reported a history of HF. Among the entire sample, the median age (25^th^ -- 75^th^ percentile) was `r svyquantile(~ age, sdata, quantiles = 0.5)[[1]][1]` years (`r svyquantile(~ age, sdata, quantiles = 0.25)[[1]][1]` to `r svyquantile(~ age, sdata, quantiles = 0.75)[[1]][1]` years), `r svytotal_df(sdata, ~ sex)[value == "Women", prop_pe %>% percent(0.1)]` were females, `r svytotal_df(sdata, ~ obesity)[value == "Yes", prop_pe %>% percent(0.1)]` had obesity, `r svytotal_df(sdata, ~ dm)[value == "Yes", prop_pe %>% percent(0.1)]` had diabetes, and `r svytotal_df(sdata, ~ htn)[value == "Yes", prop_pe %>% percent(0.1)]` had hypertension. Other baseline characteristics, stratified by the presence or absence of HF, are detailed in **Table 1.**
+
+**Prevalence of heart failure**
+
+The estimated prevalence of HF increased from `r hf_trends$overall$preds_df[year == 1988, r1(pe)]`% (`r hf_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) in 1988, representing `r r1(full_data[survey_cycle == "1988 to 1991" & age >= 20 & !is.na(hf), sum(int_weight)]*hf_trends$overall$preds_df[year == 1988, pe/100]/1000000)` million US adults, to `r hf_trends$overall$preds_df[year == 2023, r1(pe)]`% (`r hf_trends$overall$preds_df[year == 2023, pe_ci %>% ci]`%) in 2023, representing `r r1(full_data[survey_cycle == "2021 to 2023" & age >= 20 & !is.na(hf), sum(int_weight)]*hf_trends$overall$preds_df[year == 2023, pe/100]/1000000)` million US adults **(Figure 1A-B)**. In relative terms, this was a `r hf_trends$overall$contrasts_df[, pe %>% pc]` increase (`r hf_trends$overall$contrasts_df[, pe_ci %>% pr]`). However, there was no significant increase in the age-standardized prevalence of HF, which changed from `r aa_preds_df[year == 1988, r1(pe)]`% (`r aa_preds_df[year == 1988, pe_ci %>% ci]`%) to `r aa_preds_df[year == 2023, r1(pe)]`% (`r aa_preds_df[year == 2023, pe_ci %>% ci]`%) (**Figure 1C**). Changes in the prevalence of HF were primarily due to changes in the age-distribution of the US population (REV: `r round(age_rexvar, 3)`) rather than age-independent secular trends (REV: `r round(year_rexvar, 3)`). The prevalence of HF across the spectrum of age was similar in 1988 and 2023 (**Figure 1D**).
+
+There was no statistically significant evidence that temporal trends in crude HF prevalence differed by sex (*P* for interaction: `r hf_trends$sex$rrr_df$pval_int %>% p`; **eFigure 1A**). Increases in the prevalence of HF were more pronounced in Non-Hispanic White persons (`r hf_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic White", pe_ci %>% pr]`) but were not seen in Non-Hispanic Black, Hispanic, or other minority persons (`r hf_trends$race_binary$contrasts_df[int_factor == "Non-Hispanic Black, Hispanic, or Other Minority", pe_ci %>% pr]`) (*P* for interaction: `r hf_trends$race_binary$rrr_df$pval_int %>% p`; **eFigure 1B**)
+
+**Prevalence of risk factors**
+
+***Elevated blood pressure:*** The prevalence of an elevated blood pressure decreased from `r htn_trends$overall$htn$preds_df[year == 1988, r1(pe)]`% in 1988 (`r htn_trends$overall$htn$preds_df[year == 1988, pe_ci %>% ci]`%) to `r htn_trends$overall$htn$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r htn_trends$overall$htn$preds_df[year == 2023, pe_ci %>% ci]`%), a `r htn_trends$overall$htn$contrasts_df[, pe %>% pc]` decrease (`r htn_trends$overall$htn$contrasts_df[, pe_ci %>% pr]`) **(Table 1 & Figure 2A)**. For stage 1 hypertension, prevalence decreased from `r htn_trends$overall$htn1$preds_df[year == 1988, r1(pe)]`% in 1988 (`r htn_trends$overall$htn1$preds_df[year == 1988, pe_ci %>% ci]`%) to `r htn_trends$overall$htn1$preds_df[year == 2023, r1(pe)]`% in 2023 (`r htn_trends$overall$htn1$preds_df[year == 2023, pe_ci %>% ci]`%), a `r htn_trends$overall$htn1$contrasts_df[, pe %>% pc]` decrease (`r htn_trends$overall$htn1$contrasts_df$pe_ci %>% pr`) **(Figure 2B)**. For stage 2 hypertension, prevalence decreased from `r htn_trends$overall$htn2$preds_df[year == 1988, r1(pe)]`% in 1988 (`r htn_trends$overall$htn2$preds_df[year == 1988, pe_ci %>% ci]`%) to `r htn_trends$overall$htn2$preds_df[year == 2023, r1(pe)]`% in 2023 (`r htn_trends$overall$htn2$preds_df[year == 2023, pe_ci %>% ci]`%), a `r htn_trends$overall$htn2$contrasts_df[, pe %>% pc]` decrease (`r htn_trends$overall$htn2$contrasts_df$pe_ci %>% pr`) **(Figure 2C-D)**. There was no statistically significant evidence that temporal trends in the prevalence of an elevated blood pressure differed by sex (*P* for interaction: `r htn_trends$sex$p_interaction %>% p`) or race/ethnicity (*P* for interaction: `r htn_trends$race_binary$p_interaction %>% p`) (**eFigure 1A-2F)**.
+
+There was no appreciable change in the prevalence of patients with a history of hypertension, with the proportion being `r htn_hist2_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r htn_hist2_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) and `r htn_hist2_trends$overall$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r htn_hist2_trends$overall$preds_df[year == 2023, pe_ci %>% ci]`%), a statistically non-significant `r htn_hist2_trends$overall$contrasts_df$pe %>% pc` increase (`r htn_hist2_trends$overall$contrasts_df$pe_ci %>% pr`) (**eFigure 2)**, indicating that reductions in the prevalence of elevated blood pressure were primarily driven by improvements in blood pressure management rather than reductions in the incidence of hypertension. Among blood pressure-lowering agents, use of ACEIs/ARBs increased significantly (`r acei_arb_trends$contrasts_df[, pe_ci %>% pr]`), from `r acei_arb_trends$preds_df[year == 1988, round(pe, 1)]`% in 1988 to `r acei_arb_trends$preds_df[year == 2020, round(pe, 1)]`% in 2020 (**eFigure 3A**), as did use of beta-blockers (`r bb_trends$contrasts_df[, pe_ci %>% pr]`), which increased from `r bb_trends$preds_df[year == 1988, round(pe, 1)]`% in 1988 to `r bb_trends$preds_df[year == 2020, round(pe, 1)]`% in 2020 (**eFigure 3B**). No changes were evident in the use of calcium-channel blockers or thaizides (**eFigures 3C-D**).
+
+***Obesity:*** The prevalence of obesity increased from `r obesity_trends$overall$obesity$preds_df[year == 1988, r1(pe)]`% in 1988 (`r obesity_trends$overall$obesity$preds_df[year == 1988, pe_ci %>% ci]`%) to `r obesity_trends$overall$obesity$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r obesity_trends$overall$obesity$preds_df[year == 2023, pe_ci %>% ci]`%), an `r obesity_trends$overall$obesity$contrasts_df[, pe %>% pc]` increase (`r obesity_trends$overall$obesity$contrasts_df$pe_ci %>% pr`) **(Figure 3A)**. The prevalence of class I/II obesity increased from `r obesity_trends$overall$obesity12$preds_df[year == 1988, r1(pe)]`% in 1988 (`r obesity_trends$overall$obesity12$preds_df[year == 1988, pe_ci %>% ci]`%) to `r obesity_trends$overall$obesity12$preds_df[year == 2023, r1(pe)]`% in 2023 (`r obesity_trends$overall$obesity12$preds_df[year == 2023, pe_ci %>% ci]`%), a `r obesity_trends$overall$obesity12$contrasts_df[, pe %>% pc]` increase (`r obesity_trends$overall$obesity12$contrasts_df$pe_ci %>% pr`) **(Figure 3B)**. The prevalence of class III obesity (BMI ≥ 40kg/m^2^) increased from `r obesity_trends$overall$obesity3$preds_df[year == 1988, r1(pe)]`% in 1988 (`r obesity_trends$overall$obesity3$preds_df[year == 1988, pe_ci %>% ci]`%) to `r obesity_trends$overall$obesity3$preds_df[year == 2023, r1(pe)]`% in 2023 (`r obesity_trends$overall$obesity3$preds_df[year == 2023, pe_ci %>% ci]`%), a `r obesity_trends$overall$obesity3$contrasts_df[, pe %>% pc]` increase (`r obesity_trends$overall$obesity3$contrasts_df$pe_ci %>% pr`) **(Figure 3C-D)**. There was no statistically significant evidence that temporal trends in the prevalence of obesity differed by sex (*P* for interaction: `r obesity_trends$sex$p_interaction %>% p`) (**eFigure 4A-C**). Increases in obesity among Non-Hispanic Black, Hispanic, or other minority persons appeared to plateau after 2010, though no such plateau was seen for Non-Hispanic White persons (*P* for interaction: `r obesity_trends$race_binary$p_interaction %>% p`) (**eFigure 4D-F**).
+
+***Insulin resistance:*** The prevalence of prediabetes or diabetes increased from `r dm_trends$overall$pre_dm_or_dm$preds_df[year == 1988, r1(pe)]`% in 1988 (`r dm_trends$overall$pre_dm_or_dm$preds_df[year == 1988, pe_ci %>% ci]`%) to `r dm_trends$overall$pre_dm_or_dm$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r dm_trends$overall$pre_dm_or_dm$preds_df[year == 2023, pe_ci %>% ci]`%), a `r dm_trends$overall$pre_dm_or_dm$contrasts_df[, pe %>% pc]` increase (`r dm_trends$overall$pre_dm_or_dm$contrasts_df$pe_ci %>% pr`) **(Figure 4A)**. The prevalence of prediabetes did not change significantly, being `r dm_trends$overall$pre_dm$preds_df[year == 1988, r1(pe)]`% in 1988 (`r dm_trends$overall$pre_dm$preds_df[year == 1988, pe_ci %>% ci]`%) and `r dm_trends$overall$pre_dm$preds_df[year == 2023, r1(pe)]`% in 2023 (`r dm_trends$overall$pre_dm$preds_df[year == 2023, pe_ci %>% ci]`%), a statistically non-significant `r dm_trends$overall$pre_dm$contrasts_df[, pe %>% pc]` increase (`r dm_trends$overall$pre_dm$contrasts_df$pe_ci %>% pr`) (**Figure 4B)**. The prevalence of diabetes increased from `r dm_trends$overall$dm$preds_df[year == 1988, r1(pe)]`% in 1988 (`r dm_trends$overall$dm$preds_df[year == 1988, pe_ci %>% ci]`%) to `r dm_trends$overall$dm$preds_df[year == 2023, r1(pe)]`% in 2023 (`r dm_trends$overall$dm$preds_df[year == 2023, pe_ci %>% ci]`%), a `r dm_trends$overall$dm$contrasts_df[, pe %>% pc]` increase (`r dm_trends$overall$dm$contrasts_df$pe_ci %>% pr`) **(Figure 4C-D)**. There was no statistically significant evidence that temporal trends in the prevalence of prediabetes or diabetes differed by sex (*P* for interaction: `r dm_trends$sex$p_interaction %>% p`) or race/ethnicity (*P* for interaction: `r dm_trends$race_binary$p_interaction %>% p`) (**eFigure 5A-F)**.
+
+***Lipid abnormalities:*** The prevalence of current hypercholesterolemia decreased from `r hypercholesterol_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r hypercholesterol_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r hypercholesterol_trends$overall$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r hypercholesterol_trends$overall$preds_df[year == 2023, pe_ci %>% ci]`%), a `r hypercholesterol_trends$overall$contrasts_df[, pe %>% pc]` decrease (`r hypercholesterol_trends$overall$contrasts_df$pe_ci %>% pr`) **(eFigure 6)**. The prevalence of elevated LDL-C decreased from `r hyperldl_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r hyperldl_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r hyperldl_trends$overall$preds_df[year == 2020, round(pe, 1)]`% in 2020 (`r hyperldl_trends$overall$preds_df[year == 2020, pe_ci %>% ci]`%), a `r hyperldl_trends$overall$contrasts_df[, pe %>% pc]` decrease (`r hyperldl_trends$overall$contrasts_df$pe_ci %>% pr`) **(eFigure 7)**. The prevalence of elevated triglycerides decreased from `r hypertg_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r hypertg_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r hypertg_trends$overall$preds_df[year == 2020, round(pe, 1)]`% in 2020 (`r hypertg_trends$overall$preds_df[year == 2020, pe_ci %>% ci]`%), a `r hypertg_trends$overall$contrasts_df[, pe %>% pc]` decrease (`r hypertg_trends$overall$contrasts_df$pe_ci %>% pr`) **(eFigure 8)**. There was no statistically significant evidence that temporal trends in the prevalence of hypercholesterolemia differed by sex (*P* for interaction: `r hypercholesterol_trends$sex$rrr_df$pval_int %>% p`) or race/ethnicity (*P* for interaction: `r hypercholesterol_trends$race_binary$rrr_df$pval_int %>% p`) (**eFigure 9A-B)**.
+
+The decline in the prevalence of patients with a history of hypercholesterolemia was lesser in magnitude and not statistically significant, from `r dyslipid_hist2_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r dyslipid_hist2_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r dyslipid_hist2_trends$overall$preds_df[year == 2023, round(pe, 1)]`% in 2023 (`r dyslipid_hist2_trends$overall$preds_df[year == 2023, pe_ci %>% ci]`%), a statistically non-significant `r dyslipid_hist2_trends$overall$contrasts_df[, pe %>% pc]` decrease (`r dyslipid_hist2_trends$overall$contrasts_df$pe_ci %>% pr`) (**eFigure 10**), indicating that reductions were primarily driven by improvements in cholesterol management rather than reductions in the incidence of hypercholesterolemia. Concurrent with these declines, statin use increased significantly, from (`r statin_trends$contrasts_df[, pe_ci %>% pr]`), from `r statin_trends$preds_df[year == 1988, round(pe, 1)]`% in 1988 to `r statin_trends$preds_df[year == 2020, round(pe, 1)]`% in 2020 (**eFigure 11**).
+
+***History of myocardial infarction***: The prevalence of a prior self-reported myocardial infarction decreased from `r mi_trends$overall$preds_df[year == 1988, r1(pe)]`% in 1988 (`r mi_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r mi_trends$overall$preds_df[year == 2023, r1(pe)]`% in 2023 (`r mi_trends$overall$preds_df[year == 2023, pe_ci %>% ci]`%), a `r mi_trends$overall$contrasts_df[, pe %>% pc]` decrease (`r mi_trends$overall$contrasts_df$pe_ci %>% pr`) **(eFigure 12)**. On a relative basis, the decline in proportion of patients with an MI was more pronounced among females (`r mi_trends$sex$contrasts_df[int_factor == "Women", pe_ci %>% pr]`) than males (`r mi_trends$sex$contrasts_df[int_factor == "Men", pe_ci %>% pr]`) (*P* for interaction: `r mi_trends$sex$rrr_df$pval_int %>% p`). By 2023, an estimated `r mi_trends$sex$preds_df[sex == "Females" & year == 2023, r1(pe)]`% females with HF had a previous MI compared to `r mi_trends$sex$preds_df[sex == "Males" & year == 2023, r1(pe)]`% for males (**eFigure 13A**). There was no statistically significant evidence that trends differed by race/ethnicity (*P* for interaction: `r mi_trends$race_binary$rrr_df$pval_int %>% p`) (**eFigure 13B**).
+
+***Chronic Kidney Disease***: The prevalence of CKD increased from `r ckd345_albumin_trends$overall$preds_df[year == 1988, r1(pe)]`% (`r ckd345_albumin_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r ckd345_albumin_trends$overall$preds_df[year == 2020, r1(pe)]`% in 2023 (`r ckd345_albumin_trends$overall$preds_df[year == 2020, pe_ci %>% ci]`%), a `r ckd345_albumin_trends$overall$contrasts_df[, pe %>% pc]` increase (`r ckd345_albumin_trends$overall$contrasts_df$pe_ci %>% pr`) **(eFigure 14)**. There were no significant differences by sex (*P* for interaction: `r ckd345_trends$sex$rrr_df$pval_int %>% p`) or race (*P* for interaction: `r ckd345_trends$race_binary$rrr_df$pval_int %>% p`) (**eFigures 15A-B**).The change in a reduced eGFR, from `r ckd345_trends$overall$preds_df[year == 1988, r1(pe)]`% (`r ckd345_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r ckd345_trends$overall$preds_df[year == 2020, r1(pe)]`% (`r ckd345_trends$overall$preds_df[year == 2020, pe_ci %>% ci]`%), was not statistically significant (`r ckd345_trends$overall$contrasts_df$pe_ci %>% pr`) (**eFigure 16A**). The prevalence of albuminuria increased from `r albuminuria_trends$overall$preds_df[year == 1988, r1(pe)]`% (`r albuminuria_trends$overall$preds_df[year == 1988, pe_ci %>% ci]`%) to `r albuminuria_trends$overall$preds_df[year == 2020, r1(pe)]`% (`r albuminuria_trends$overall$preds_df[year == 2020, pe_ci %>% ci]`%) (`r albuminuria_trends$overall$contrasts_df$pe_ci %>% pr`) (**eFigure 16B**). 
+
+**Temporal trends using continuous risk factors**
+Density plots and boxplots showing the continuous distribution of risk factors among respondents with heart failure, in the first 2 survey cycles (1988-1994) and last 2 survey cycles (2017-2023, or 2015-2020 for variables not measured in 2021-2023), are shown in eFigures 17-21 and were consistent with the main analysis. Trends in the mean level of risk factors, according to whether these risk factors were below or above thresholds used to define different disease states, are shown in **eFigures 22-28**. Results were notable for an increase in mean HbA1c among respondents with an HbA1c below 6.5% (i.e., without diabetes), but no such increase was evident in patients with an HbA1c above 6.5% (i.e., with diabetes).
+
+
+**Comparison to trends in the non-HF Population**
+
+**eFigure 29** shows comparisons of temporal trends in the prevalence of risk factors in respondents with HF compared to respondents without HF. Trends which were significantly more pronounced in patients with HF included reductions in elevated blood pressure, hypercholesterolemia, myocardial infarction and increases in obesity. For diabetes, CKD, elevated LDL-C, and hypertriglyceridemia, there was no statistically significant evidence that trends differed in respondents with HF compared to respondents without HF. **eTable 2** shows the same data using continuous versions of risk factors. Results were similar except that the difference in reductions of LDL-cholesterol reached statistical significance.
+
+**Figures:**
+
+**Figure 1. Temporal trends in the (A) crude prevalence (proportional), (B) crude prevalence (absolute number), (C) age-standardized prevalence, and (D) age-stratified prevalence of heart failure (HF) in the United States from 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI. In panel B, the gap between 1994 and 1999 corresponds to a time-period during which no NHANES surveys were conducted and thus during which no survey weights for US adults aged ≥20 years were available. The sum of these survey weights (which is the number of US adults aged ≥20 years) is necessary to convert the proportions shown in panel A to the absolute numbers shown in panel B.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+ggplotify::as.ggplot(hf_panels_fig)
+```
+
+
+**Figure 2. Temporal trends in the prevalence of (A) elevated blood pressure (SBP ≥130mmHg or DBP ≥80mmHg), (B) stage 1 hypertension (SBP between 130 and 139mmHg or DBP between 80 and 89mmHg), (C) stage 2 hypertension (SBP ≥140mmHg or DBP ≥90mmHg), and (D) cumulative prevalence of these categories among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+ggplotify::as.ggplot(htn_panels_fig)
+```
+
+**Figure 3. Temporal Trends in the prevalence of (A) obesity (BMI ≥30 kg/m^2^), (B) class I/II obesity (BMI between 30 and 39.9 kg/m^2^), (C) class III obesity (BMI ≥40 kg/m^2^), and (D) cumulative prevalence of these categories among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+ggplotify::as.ggplot(obesity_panels_fig)
+```
+
+
+**Figure 4. Temporal trends in the prevalence of (A) impaired glucose homeostasis (HbA1c ≥5.7%), (B) prediabetes (HbA1c between 5.7 and 6.4%), (C) diabetes (HbA1c ≥6.5%), and (D) cumulative prevalence of these categories among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+ggplotify::as.ggplot(dm_panels_fig)
+```
+
+
+**eFigures.**
+
+**eFigure 1. Temporal trends in the prevalence of elevated blood pressure among patients with heart failure (HF) in the United States from 1988 to 2023 by (A-C) sex and (D-F) race/ethnicity.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) Elevated blood pressure (SBP ≥130mmHg or DBP ≥80mmHg) by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`elevated blood pressure`
+```
+
+**(B) Stage 1 hypertension (SBP between 130 and 139mmHg or DBP between 80 and 89mmHg) by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`stage 1 hypertension`
+```
+
+**(C) Stage 2 hypertension (SBP ≥140mmHg or DBP ≥90mmHg) by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`stage 2 hypertension`
+```
+
+**(D) Elevated blood pressure by (SBP ≥130mmHg or DBP ≥80mmHg) by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`elevated blood pressure`
+```
+
+**(E) Stage 1 hypertension (SBP between 130 and 139mmHg or DBP between 80 and 89mmHg) by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`stage 1 hypertension`
+```
+
+**(F) Stage 2 hypertension (SBP ≥140mmHg or DBP ≥90mmHg) by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`stage 2 hypertension`
+```
+
+**eFigure 2. Temporal trends in the prevalence of elevated blood pressure (SBP ≥130mmHg, DBP ≥80mmHg, or patient self-report of a previous diagnosis ) among patients with heart failure (HF) in the United States from 1988 to 2023 by (A-C) sex and (D-F) race/ethnicity.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`a history of hypertension`
+```
+
+**eFigure 3. Temporal trends in the use of different blood pressure-lowering agents among patients with heart failure (HF) in the United States from 1988 to 2023. The four analyzed agents were (A) Angiotensin converting enzyme inhibitors or angiotensin receptor blockers, (B) beta-blockers, (C) calcium channel blockers, and (D) thiazides** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**A) Angiotensin converting enzyme inhibitors or angiotensin receptor blockers**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_meds$`use of ACEis or ARBs`
+```
+
+**(B) Beta-blockers**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_meds$`use of beta-blockers`
+```
+
+**(C) Calcium channel blockers**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_meds$`use of calcium channel blockers`
+```
+
+**(D) Thiazides**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_meds$`use of thiazides`
+```
+
+**eFigure 4. Temporal trends in the prevalence of obesity among patients with heart failure (HF) in the United States from 1988 to 2023 by (A-C) sex and (D-F) race/ethnicity.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) Obesity by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$obesity
+```
+
+**(B) Class I/II obesity by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`class I or II obesity`
+```
+
+**(C) Class III obesity by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`class III obesity`
+```
+
+**(D) Obesity by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$obesity
+```
+
+**(E) Class I/II obesity by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`class I or II obesity`
+```
+
+**(F) Class III obesity by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`class III obesity`
+```
+
+**eFigure 5. Temporal trends in the prevalence of insulin resistance among patients with heart failure (HF) in the United States from 1988 to 2023 by (A-C) sex and (D-F) race/ethnicity.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) Diabetes or prediabetes by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`diabetes or pre-diabetes`
+```
+
+**(B) Prediabetes by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$prediabetes
+```
+
+**(C) Diabetes by sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$diabetes
+```
+
+**(D) Diabetes or prediabetes by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`diabetes or pre-diabetes`
+```
+
+**(E) Prediabetes by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$prediabetes
+```
+
+**(F) Diabetes by race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$diabetes
+```
+
+**eFigure 6. Temporal trends in the prevalence of hypercholesterolemia (total cholesterol ≥200mg/dL) among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$hypercholesterolemia
+```
+
+**eFigure 7. Temporal trends in the prevalence of elevated low-density lipoprotein cholesterol (LDL ≥160mg/dL) among patients with heart failure (HF) in the United States from 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`elevated low-density lipoprotein cholesterol`
+```
+
+**eFigure 8. Temporal trends in the prevalence of elevated triglycerides (triglycerides ≥200mg/dL) among patients with heart failure (HF) in the United States from 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$hypertriglyceridemia
+```
+
+**eFigure 9. Temporal trends in the prevalence of hypercholesterolemia (total cholesterol ≥200mg/dL) among patients with heart failure (HF) in the United States from 1988 to 2023, by (A) sex and (B) race/ethnicity.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) By sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$hypercholesterolemia
+```
+
+**(B) By race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$hypercholesterolemia
+```
+
+**eFigure 10. Temporal trends in the prevalence of a history of hypercholesterolemia (total cholesterol ≥200mg/dL or patient self-report of previous diagnosis) among patients with heart failure (HF) in the United States from 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`a history of hypercholesterolemia`
+```
+
+**eFigure 11. Temporal trends in the prevalence of using statins among patients with heart failure (HF) in the United States from 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_meds$`use of statins`
+```
+
+**eFigure 12. Temporal trends in the prevalence of a myocardial infarction among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`a previous myocardial infarction`
+```
+
+**eFigure 13. Temporal trends in the prevalence of a history of myocardial infarction among patients with heart failure (HF) in the United States from 1988 to 2023, by (A) sex and (B) race/ethnicity** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) By sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`a previous myocardial infarction`
+```
+
+**(B) By race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`a previous myocardial infarction`
+```
+
+**eFigure 14. Temporal trends in the prevalence of chronic kidney disease (CKD)  (reduced eGFR <60mL/min/1.73 m^2^ or urine albumin-creatinine ratio >30mg/g) among patients with heart failure (HF) in the United States, 1988 to 2023.** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`chronic kidney disease`
+```
+
+**eFigure 15. Temporal trends in the prevalence of chronic kidney disease among patients with heart failure (HF) in the United States from 1988 to 2023, by (A) sex and (B) race/ethnicity** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) By sex**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$sex$`chronic kidney disease`
+```
+
+**(B) By race/ethnicity**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$race_binary$`chronic kidney disease`
+```
+
+**eFigure 16. Temporal trends in the prevalence of a history of (A) albuminuria (urine albumin-creatinine ratio >30mg/g) or (B) reduced eGFR (<60mL/min/1.73 m^2^) among patients with heart failure in the United States from 1988 to 2023** Dots and whiskers represent point estimates and 95% CI for each survey cycle. The red line represents smoothed temporal trends and the blue shade represents its 95% CI.
+
+**(A) eGFR <60mL/min/1.73 m^2^**
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$`a reduced eGFR`
+```
+
+**(B) Albuminuria (urine albumin-creatinine ratio ≥30mg/g)**
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+trends_fig_rfs$overall$albuminuria
+```
+
+**eFigure 17. Distribution of (A) systolic blood pressure and (B) diastolic blood pressure among patients with heart failure in the United States, in 1988-1994 and 2017-2023.**
+
+**(A) Systolic blood pressure**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$sbp
+```
+
+**(B) Diastolic blood pressure**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$dbp
+```
+
+**eFigure 18. Distribution of body mass index among patients with heart failure in the United States, in 1988-1994 and 2017-2023.**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$bmi
+```
+
+**eFigure 19. Distribution of hemoglobin A1C among patients with heart failure in the United States, in 1988-1994 and 2017-2023.**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$hba1c
+```
+
+**eFigure 20. Distribution of (A) total cholesterol, (B) low-density lipoprotein cholesterol, and (C) triglycerides among patients with heart failure in the United States, in 1988-1994 and 2017-2023 (for total cholesterol) or 2015-2020 (for low-density lipoprotein cholesterol).**
+
+**(A) Total cholesterol**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$tc
+```
+
+**(B) Low-density lipoprotein cholesterol**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$ldl
+```
+
+**(C) Triglycerides**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$tg
+```
+
+**eFigure 21. Distribution of (A) estimated glomerular filtration rate and (B) urine albumin-creatinine ratio among patients with heart failure in the United States, in 1988-1994 and 2017-2023.**
+
+**(A) Estimated glomerular filtration rate**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$egfr
+```
+
+**(B) Urine albumin-creatinine ratio**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+density_figs$uacr
+```
+
+**eFigure 22. Temporal trends in (A) systolic and (B) diastolic blood pressure among patients with heart failure, with or without hypertension (defined by a cutoff of 13/80 mmHg).**
+
+**(A) Systolic blood pressure**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+sbp_cont_fig
+```
+
+**(B) Diastolic blood pressure**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+dbp_cont_fig
+```
+
+**eFigure 23. Temporal trends in body mass index among patients with heart failure, with or without obesity (defined by a cutoff of 30 kg/m^2^).**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+bmi_cont_fig
+```
+
+**eFigure 24. Temporal trends in glycated hemoglobin among patients with heart failure, with or without diabetes (defined by a cutoff of 6.5%).**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+hba1c_cont_fig
+```
+
+**eFigure 25. Temporal trends in total cholesterol among patients with heart failure, with or without hypercholesterolemia (defined by a cutoff of 200 mg/dL)**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+tc_cont_fig
+```
+
+**eFigure 26. Temporal trends in total cholesterol among patients with heart failure, with or without elevated low-density lipoprotein cholesterol (defined by a cutoff of 160 mg/dL)**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+ldl_cont_fig
+```
+
+**eFigure 27. Temporal trends in estimated glomerular filtration rate (eGFR) among patients with heart failure, with or without reduced eGFR (defined by a cutoff of 60 mL/min/1.73 m^2^)**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+egfr_cont_fig
+```
+
+**eFigure 28. Temporal trends in urine albumin-creatinine ratio among patients with heart failure, with or without microalbuminuria (defined by a cutoff of 30 mg/g)**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+uacr_cont_fig
+```
+
+**eFigure 29. Differences in temporal trends of risk factors between respondents with and without heart failure.**
+
+```{r, fig.width = 16, fig.height = 9, message = FALSE, warning = FALSE, echo = FALSE}
+plot(forest_fig_binary)
+```
